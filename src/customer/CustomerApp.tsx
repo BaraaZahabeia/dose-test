@@ -555,25 +555,27 @@ const heroBadge = (catalog?.settings?.hero_badge ?? '').trim();
           <h2 className="text-[17px] font-black text-[#26301C]">{selMenuTitle ? selMenuTitle : 'استكشف المنيو'}</h2>
         </div>
          <div className="pb-4">
-          {catalog?.categories?.map((c) => {
-            const catProducts = menuProducts.filter((p) => p.category === c.slug);
-            const expanded = expandedCatSlugs.has(c.slug);
-            const showProducts = expanded ? catProducts : catProducts.slice(0, 6);
+          {catalog?.menus?.filter((m) => (m.items ?? []).length > 0).map((m) => {
+            const menuProducts = m.items ?? [];
+            const expanded = expandedCatSlugs.has(String(m.id));
+            const showProducts = expanded ? menuProducts : menuProducts.slice(0, 6);
             return (
-              <div key={c.slug} className="mb-6">
+              <div key={m.id} className="mb-6">
                 <div className="mb-2 mt-4 flex items-center gap-2 px-2">
-                  <Icon name={CAT_ICONS[c.slug] ?? 'star'} size={14} className="text-[#5C6B3C]" />
-                  <h3 className="text-[14px] font-black text-[#26301C]">{c.name_ar}</h3>
-                  {catProducts.length > 6 && (
+                  <span className="grid size-6 place-items-center overflow-hidden rounded-full bg-gradient-to-br from-[#7A5A22] to-[#5C4318] text-xl">
+                    {m.image_url ? <img src={m.image_url} alt={m.title} className='size-full object-cover' loading='lazy' /> : m.emoji || '☕'}
+                  </span>
+                  <h3 className="text-[14px] font-black text-[#26301C]">{m.title}</h3>
+                  {menuProducts.length > 6 && (
                     <button onClick={() => {
                       if (expanded) {
-                        setExpandedCatSlugs((s) => { const n = new Set(s); n.delete(c.slug); return n; });
+                        setExpandedCatSlugs((s) => { const n = new Set(s); n.delete(String(m.id)); return n; });
                       } else {
-                        setExpandedCatSlugs((s) => { const n = new Set(s); n.add(c.slug); return n; });
+                        setExpandedCatSlugs((s) => { const n = new Set(s); n.add(String(m.id)); return n; });
                       }
                     }}
                       className="mr-auto text-[11px] font-bold text-[#5C6B3C] hover:text-[#26301C] underline underline-offset-4">
-                      {expanded ? 'إظهار أقل' : `عرض الكل (${catProducts.length})`}
+                      {expanded ? 'إظهار أقل' : `عرض الكل (${menuProducts.length})`}
                     </button>
                   )}
                 </div>
@@ -600,16 +602,13 @@ const heroBadge = (catalog?.settings?.hero_badge ?? '').trim();
                     ))}
                   </div>
                 ) : (
-                  <p className="text-center text-[11px] text-[#94826A] py-4">لا توجد منتجات في هذا القسم</p>
+                  <p className="text-center text-[11px] text-[#94826A] py-4">لا توجد منتجات في هذه القائمة</p>
                 )}
               </div>
             );
           })}
          </div>
-        {cat != null && (
-          <p className="pb-2 text-center text-[11px] text-[#94826A]">عرض فئة: {catalog?.categories?.find((c) => c.slug === cat)?.name_ar}</p>
-        )}
-      </section>
+       </section>
     </div>
   );
 }
