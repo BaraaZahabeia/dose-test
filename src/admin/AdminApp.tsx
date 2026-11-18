@@ -1,0 +1,1891 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { rpc, sb } from '../lib/supabase';
+import { eur, fmtDateTimeNum, shopStatus } from '../lib/utils';
+import { Icon, type IconName } from '../components/Icons';
+
+/* ============================================================
+   لوحة الإدارة — /admin
+   الطلبات · المنتجات · المكافآت · العملاء · الإعلانات · الإشعارات · الإعدادات
+   ============================================================ */
+
+const ADMIN_KEY = 'dose_admin_token_v1';
+const ADMIN_ROLE_KEY = 'dose_admin_role_v1';
+const VAPID_PUB = 'BCDKL0U34tZgWEGIygt6PLe6tpX_7kOn4bkavZYoO6OAPdEBC0kjDpLxuDouKqWNqjgsC5h9V2gNJ08POBsRLmo';
+type AdminRole = 'owner' | 'worker';
+
+function urlBase64ToUint8Array(base64: string): Uint8Array {
+  const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+  const b64 = (base64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(b64);
+  const arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+
+/** استدعاء RPC إداري — إن انتهت الجلسة (null) خروج تلقائي لشاشة الدخول */
+async function arpc<T = any>(fn: string, args: Record<string, any> = {}): Promise<T> {
+  const d = await rpc<T>(fn, args);
+  if (d === null) {
+    localStorage.removeItem(ADMIN_KEY);
+    setTimeout(() => location.reload(), 600);
+    throw new Error('انتهت صلاحية الجلسة — سجّل الدخول من جديد');
+  }
+  return d;
+}
+const TABS: { id: TabId; label: string; icon: IconName; roles: AdminRole[] }[] = [
+  { id: 'dashboard', label: 'الرئيسة', icon: 'chart', roles: ['owner'] },
+  { id: 'sales', label: 'المبيعات', icon: 'store', roles: ['owner'] },
+  { id: 'orders', label: 'الطلبات', icon: 'clipboard', roles: ['owner', 'worker'] },
+  { id: 'products', label: 'المنتجات', icon: 'package', roles: ['owner'] },
+  { id: 'menus', label: 'القوائم', icon: 'receipt', roles: ['owner'] },
+  { id: 'extras', label: 'الإضافات', icon: 'plus', roles: ['owner'] },
+  { id: 'customers', label: 'العملاء', icon: 'users', roles: ['owner'] },
+  { id: 'rewards', label: 'المكافآت', icon: 'gift', roles: ['owner'] },
+  { id: 'ads', label: 'الإعلانات', icon: 'megaphone', roles: ['owner'] },
+  { id: 'notify', label: 'الإشعارات', icon: 'bell', roles: ['owner'] },
+  { id: 'hours', label: 'وقت الدوام', icon: 'clock', roles: ['owner'] },
+  { id: 'order_time', label: 'وقت الطلب', icon: 'timer', roles: ['owner'] },
+  { id: 'promo', label: 'كود الخصم', icon: 'gift', roles: ['owner'] },
+  { id: 'hero', label: 'تفاصيل الهيرو', icon: 'image', roles: ['owner'] },
+  { id: 'permissions', label: 'صلاحيات العميل', icon: 'settings', roles: ['owner'] },
+  { id: 'settings', label: 'الإعدادات', icon: 'settings', roles: ['owner'] },
+];
+type TabId = 'dashboard' | 'sales' | 'extras' | 'orders' | 'products' | 'menus' | 'customers' | 'rewards' | 'ads' | 'notify' | 'hours' | 'order_time' | 'settings' | 'promo' | 'hero' | 'permissions';
+
+export default function AdminApp() {
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem(ADMIN_KEY));
+  const [role, setRole] = useState<AdminRole>(() => (localStorage.getItem(ADMIN_ROLE_KEY) as AdminRole) || 'owner');
+  const [tab, setTab] = useState<TabId>('dashboard');
+
+  const logout = () => {
+    localStorage.removeItem(ADMIN_KEY);
+    localStorage.removeItem(ADMIN_ROLE_KEY);
+    setToken(null);
+    setRole('owner');
+    setTab('dashboard');
+  };
+
+  /* التبويبات المتاحة لهذا الدور */
+  const tabs = TABS.filter((t) => t.roles.includes(role));
+  /* إعادة التبويب الحالي إذا لم يكن متاحًا للدور الحالي */
+  useEffect(() => {
+    if (!tabs.some((t) => t.id === tab)) setTab(tabs[0]?.id ?? 'orders');
+  }, [role, tab]);
+
+  useEffect(() => {
+    if (!token) return;
+    (async () => {
+      try {
+        if (typeof Notification === 'undefined' || !('PushManager' in window)) return;
+        const perm = Notification.permission === 'default' ? await Notification.requestPermission() : Notification.permission;
+        if (perm !== 'granted') return;
+        const reg = await navigator.serviceWorker.ready;
+        let sub = await reg.pushManager.getSubscription();
+        if (!sub) {
+          sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(VAPID_PUB) });
+        }
+        await rpc('save_admin_push_subscription', { p_token: token, p_sub: JSON.stringify(sub) });
+      } catch {}
+    })();
+  }, [token]);
+
+  /* المراقبة المستمرة — تعمل على كل التبويبات ولا تتوقف */
+  const seenRef = useRef<Set<number>>(new Set(JSON.parse(localStorage.getItem('dose_seen_orders') || '[]')));
+  const firstScan = useRef(true);
+  const [alertMsg, setAlertMsg] = useState<string | null>(null);
+  /* عداد الطلبات الجديدة لأيقونة الإشعارات — يزيد عند وصول طلب ويقل عند إكماله */
+  const [newOrdersCount, setNewOrdersCount] = useState(0);
+  const [bellShake, setBellShake] = useState(0);
+
+  /* نغمة تنبيه أعلى وأوضح لطلب جديد */
+  const beep = () => {
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const now = ctx.currentTime;
+      const master = ctx.createGain();
+      master.gain.value = 1.0; // أعلى مستوى صوت ممكن
+      /* مُضخّم ديناميكي — يرفع مستوى التنبيه أكثر */
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -24; comp.knee.value = 30; comp.ratio.value = 12;
+      comp.attack.value = 0.003; comp.release.value = 0.25;
+      master.connect(comp);
+      comp.connect(ctx.destination);
+      /* نغمة مربّعة حادة — أعلى وأوضح من النغمة المثلثة السابقة */
+      const tone = (freq: number, at: number, dur: number, vol = 0.9) => {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = 'square';
+        o.frequency.setValueAtTime(freq, now + at);
+        g.gain.setValueAtTime(0.0001, now + at);
+        g.gain.linearRampToValueAtTime(vol, now + at + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + at + dur);
+        o.connect(g);
+        g.connect(master);
+        o.start(now + at);
+        o.stop(now + at + dur);
+      };
+      /* نمط رنين جديد: بوّقتان متتاليتان ثم نغمة ختامية عالية */
+      tone(1046, 0, 0.14);          // بوّقة أولى — دو
+      tone(1568, 0.13, 0.17);       // صول
+      tone(1046, 0.42, 0.14);       // بوّقة ثانية — دو
+      tone(1568, 0.55, 0.17);       // صول
+      tone(2093, 0.78, 0.5);        // نغمة ختامية عالية جدًا
+      setTimeout(() => ctx.close(), 1700);
+    } catch {}
+  };
+
+  useEffect(() => {
+    if (!token) return;
+    let stopped = false;
+    const check = async () => {
+      try {
+        const rows = await rpc<any[]>('admin_list_orders', { p_token: token, p_limit: 50 });
+        if (!Array.isArray(rows) || stopped) return;
+        const fresh = rows.filter((o) => o.status === 'pending' && !seenRef.current.has(o.order_number));
+        if (fresh.length > 0 && !firstScan.current) {
+          beep();
+          setBellShake(Date.now());
+          const o = fresh[0];
+          setAlertMsg('🔔 طلب جديد #' + o.order_number + ' — ' + o.customer_name + ' (' + eur(o.total_cents) + ')');
+          setTimeout(() => setAlertMsg(null), 7000);
+          try {
+            if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+              new Notification('🔔 طلب جديد #' + o.order_number, {
+                body: o.customer_name + ' — ' + eur(o.total_cents) + ' (' + (o.fulfillment_type === 'delivery' ? 'توصيل' : 'استلام') + ')',
+                icon: '/logo.jpg', tag: 'order-' + o.id,
+              });
+            }
+          } catch {}
+        }
+        setNewOrdersCount(rows.filter((o) => o.status === 'pending').length);
+        rows.forEach((o) => seenRef.current.add(o.order_number));
+        firstScan.current = false;
+        localStorage.setItem('dose_seen_orders', JSON.stringify([...seenRef.current].slice(-500)));
+      } catch {}
+    };
+    check();
+    const t = setInterval(check, 8000);
+    return () => { stopped = true; clearInterval(t); };
+  }, [token]);
+
+  if (!token) return <AdminLogin onLogged={(t, r) => {
+    localStorage.setItem(ADMIN_KEY, t);
+    localStorage.setItem(ADMIN_ROLE_KEY, r);
+    setToken(t);
+    setRole(r);
+    setTab(r === 'worker' ? 'orders' : 'dashboard');
+  }} />;
+
+  return (
+    <div className="min-h-full bg-[#F0F4E4]">
+      <header className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-3 bg-coffee-950 px-5 py-3 text-cream shadow-lg">
+        <div className="flex items-center gap-3">
+          <img src="/logo.jpg" alt="Dose" className="size-10 rounded-xl border-2 border-gold/50 object-cover" />
+          <div className="leading-tight">
+            <p className="font-serif text-base font-bold">Dose — لوحة الإدارة</p>
+            <p className="text-[9px] font-bold uppercase tracking-[.2em] text-gold/80">{role === 'worker' ? 'Worker — Orders' : 'Admin Dashboard'}</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button key={bellShake || 'bell'} onClick={() => setTab('orders')} title="الطلبات الجديدة"
+            className={`relative rounded-xl border border-white/20 bg-white/10 p-2.5 transition hover:bg-white/20 active:scale-95 ${bellShake ? 'anim-shake' : ''}`}>
+            <Icon name="bell" size={17} />
+            {newOrdersCount > 0 && (
+              <span key={newOrdersCount} className="anim-pop absolute -top-1.5 -end-1.5 grid h-5 min-w-5 place-items-center rounded-full bg-[#C4482E] px-1 text-[10px] font-black text-white shadow-lg">
+                {newOrdersCount > 99 ? '99+' : newOrdersCount}
+              </span>
+            )}
+          </button>
+          <button onClick={logout} className="rounded-xl border border-white/20 bg-white/10 px-4 py-2 text-xs font-bold transition hover:bg-white/20">تسجيل الخروج</button>
+        </div>
+      </header>
+
+      <nav className="no-scrollbar sticky top-[68px] z-30 flex gap-2 overflow-x-auto border-b border-beige bg-white/90 px-4 py-2.5 backdrop-blur">
+        {tabs.map((t) => (
+          <button key={t.id} onClick={() => setTab(t.id)}
+            className={`flex flex-none items-center gap-1.5 rounded-full px-4 py-2 text-xs font-extrabold transition ${tab === t.id ? 'bg-coffee-900 text-cream shadow' : 'bg-[#E3E9C8] text-neutral-500 hover:text-neutral-800'}`}>
+            <Icon name={t.icon} size={14} /> {t.label}
+          </button>
+        ))}
+      </nav>
+
+      {alertMsg && (
+        <div className="sticky top-[112px] z-50 mx-auto mt-3 w-fit max-w-[92vw] rounded-full bg-amber-400 px-5 py-2.5 text-center text-xs font-black text-amber-950 shadow-xl anim-pop">
+          {alertMsg}
+        </div>
+      )}
+      <main className="mx-auto max-w-6xl p-4">
+        {tab === 'dashboard' && <Dashboard token={token} />}
+        {tab === 'sales' && <SalesTab token={token} />}
+        {tab === 'orders' && <OrdersTab token={token} />}
+        {tab === 'products' && <ProductsTab token={token} />}
+        {tab === 'menus' && <MenusTab token={token} />}
+        {tab === 'extras' && <ExtrasTab token={token} />}
+        {tab === 'customers' && <CustomersTab token={token} />}
+        {tab === 'rewards' && <RewardsTab token={token} />}
+        {tab === 'ads' && <AdsTab token={token} />}
+        {tab === 'notify' && <NotifyTab token={token} />}
+      {tab === 'order_time' && <OrderTimeTab token={token} />}
+        {tab === 'hours' && <HoursTab token={token} />}
+        {tab === 'promo' && <PromoTab token={token} />}
+        {tab === 'hero' && <HeroTab token={token} />}
+        {tab === 'permissions' && <PermissionsTab token={token} />}
+        {tab === 'settings' && <SettingsTab token={token} />}
+      </main>
+    </div>
+  );
+}
+
+/* ============================ الدخول ============================ */
+function AdminLogin({ onLogged }: { onLogged: (t: string, r: AdminRole) => void }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async () => {
+    if (busy) return;
+    setBusy(true); setErr('');
+    try {
+      const r = await arpc<{ token: string; role?: string }>('admin_login', { p_username: username, p_password: password });
+      onLogged(r.token, r.role === 'worker' ? 'worker' : 'owner');
+    } catch (e: any) { setErr(e.message); setBusy(false); }
+  };
+  return (
+    <div className="grid min-h-full place-items-center bg-gradient-to-b from-[#F6E7C8] to-[#F3DEBA] p-6">
+      <div className="w-full max-w-sm rounded-3xl bg-white p-7 shadow-xl anim-pop">
+        <div className="text-center"><img src="/logo.jpg" alt="Dose" className="mx-auto size-16 rounded-2xl object-cover shadow" /></div>
+        <h2 className="mt-4 text-center text-lg font-black text-coffee-900">لوحة الإدارة — Dose</h2>
+        <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="اسم المستخدم" dir="ltr"
+          className="mt-5 h-12 w-full rounded-2xl border-2 border-beige bg-[#FAF5EA] px-4 text-center font-bold outline-none focus:border-gold" />
+        <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" placeholder="كلمة المرور" dir="ltr"
+          className="mt-3 h-12 w-full rounded-2xl border-2 border-beige bg-[#FAF5EA] px-4 text-center font-bold outline-none focus:border-gold" />
+        {err && <p className="mt-3 rounded-xl bg-red-50 px-3 py-2 text-center text-xs font-bold text-red-600">{err}</p>}
+        <button onClick={submit} disabled={busy}
+          className="mt-5 w-full rounded-2xl bg-gradient-to-l from-gold to-gold-deep py-3.5 text-base font-extrabold text-white shadow-lg active:scale-[.98] disabled:opacity-50">
+          {busy ? 'جارٍ الدخول…' : 'دخول'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================ عناصر مشتركة ============================ */
+const Card = ({ children, className = '' }: { children: React.ReactNode; className?: string }) => (
+  <div className={`rounded-3xl bg-white p-5 shadow-sm ring-1 ring-beige ${className}`}>{children}</div>
+);
+const Field = ({ label, children }: { label: string; children: React.ReactNode }) => (
+  <label className="block"><span className="mb-1 block text-xs font-bold text-neutral-500">{label}</span>{children}</label>
+);
+const inputCls = 'h-11 w-full rounded-xl border-2 border-beige bg-[#FAF5EA] px-3 text-sm font-bold outline-none focus:border-gold';
+const btnCls = 'rounded-xl bg-coffee-900 px-4 py-2.5 text-xs font-extrabold text-cream transition active:scale-95 disabled:opacity-40';
+
+const useAdminAction = () => {
+  const [busy, setBusy] = useState(false);
+  const wrap = async (fn: () => Promise<void>) => {
+    if (busy) return; setBusy(true);
+    try { await fn(); } catch (e: any) { alert(e.message); } finally { setBusy(false); }
+  };
+  return { busy, wrap };
+};
+
+/* حقل رفع صورة من الجهاز إلى Supabase Storage */
+function ImageUploadField({ value, onChange, folder }: { value: string; onChange: (url: string) => void; folder: string }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  // ضغط الصورة بقوة: أقصى أبعاد 800×800، JPEG بجودة تنازليّة حتى يقل الحجم عن 200 كيلوبايت
+  // (التخزين في السحابة محدود بـ 1 جيجابايت فقط)
+  const compress = (file: File): Promise<File> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        let { width, height } = img;
+        const MAX = 800;
+        if (width > MAX || height > MAX) {
+          const ratio = Math.min(MAX / width, MAX / height);
+          width = Math.round(width * ratio);
+          height = Math.round(height * ratio);
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) { reject(new Error('Canvas not supported')); return; }
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // تقليل الجودة تدريجيًا حتى يقل الحجم عن 200 كيلوبايت
+        let quality = 0.7;
+        const tryCompress = () => {
+          canvas.toBlob(
+            (blob) => {
+              if (!blob) { reject(new Error('Compression failed')); return; }
+              if (blob.size > 200 * 1024 && quality > 0.3) {
+                quality -= 0.1;
+                tryCompress();
+                return;
+              }
+              const compressed = new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), { type: 'image/jpeg' });
+              resolve(compressed);
+            },
+            'image/jpeg',
+            quality
+          );
+        };
+        tryCompress();
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('failed to read image')); };
+      img.src = url;
+    });
+  };
+
+  const upload = async (file: File) => {
+    setBusy(true); setErr('');
+    try {
+      if (!file.type.startsWith('image/')) throw new Error('اختر صورة صحيحة');
+      if (file.size > 10 * 1024 * 1024) throw new Error('حجم الصورة يجب أن يكون أقل من 10 ميجابايت');
+      const compressed = await compress(file);
+      if (compressed.size > 300 * 1024) throw new Error('الصورة كبيرة جدًا حتى بعد الضغط — جرب صورة أصغر');
+      const path = folder + '/' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.jpg';
+      const { error } = await sb.storage.from('images').upload(path, compressed, { contentType: 'image/jpeg' });
+      if (error) throw error;
+      onChange(sb.storage.from('images').getPublicUrl(path).data.publicUrl);
+    } catch (e: any) {
+      setErr(e.message || 'فشل رفع الصورة');
+    }
+    setBusy(false);
+  };
+  return (
+    <div>
+      <div className="flex items-center gap-3">
+        {value
+          ? <img src={value} alt="" className="size-16 rounded-2xl object-cover shadow ring-1 ring-fresh-100" />
+          : <span className="grid size-16 place-items-center rounded-2xl bg-[#E3E9C8] text-neutral-400"><Icon name="package" size={20} /></span>}
+        <label className="cursor-pointer rounded-xl bg-coffee-900 px-4 py-2.5 text-[11px] font-extrabold text-cream transition active:scale-95">
+          {busy ? 'جارٍ الرفع…' : value ? 'تغيير الصورة' : 'رفع صورة من الجهاز'}
+          <input type="file" accept="image/*" className="hidden" disabled={busy}
+            onChange={(e) => { const file = e.target.files?.[0]; if (file) upload(file); e.target.value = ''; }} />
+        </label>
+        {value && <span className="text-[10px] font-extrabold text-green-600">جاهزة للعرض</span>}
+      </div>
+      {err && <p className="mt-1.5 text-[11px] font-bold text-red-600">{err}</p>}
+    </div>
+  );
+}
+
+/* ============================ الرئيسية ============================ */
+function Dashboard({ token }: { token: string }) {
+  const [stats, setStats] = useState<any>(null);
+  useEffect(() => {
+    const load = () => arpc<any>('admin_stats', { p_token: token }).then(setStats).catch(() => {});
+    load(); const t = setInterval(load, 20000); return () => clearInterval(t);
+  }, [token]);
+  const cards: { label: string; value: any; icon: IconName; color: string }[] = [
+    { label: 'العملاء', value: stats?.customers ?? '—', icon: 'users', color: 'bg-blue-50 text-blue-700' },
+    { label: 'إجمالي الطلبات', value: stats?.orders ?? '—', icon: 'receipt', color: 'bg-amber-50 text-amber-700' },
+    { label: 'طلبات حالية', value: stats?.active_orders ?? '—', icon: 'clock', color: 'bg-orange-50 text-orange-700' },
+    { label: 'طلبات مكتملة', value: stats?.completed_orders ?? '—', icon: 'check', color: 'bg-emerald-50 text-emerald-700' },
+    { label: 'المبيعات', value: stats != null ? eur(stats.sales_cents, 'ل.س') : '—', icon: 'chart', color: 'bg-green-50 text-green-700' },
+    { label: 'نقاط معلقة', value: stats?.points_outstanding ?? '—', icon: 'star', color: 'bg-yellow-50 text-yellow-700' },
+    { label: 'استبدالات', value: stats?.redemptions ?? '—', icon: 'gift', color: 'bg-purple-50 text-purple-700' },
+    { label: 'منتجات نشطة', value: stats?.products ?? '—', icon: 'package', color: 'bg-rose-50 text-rose-700' },
+  ];
+  return (
+    <div className="grid grid-cols-2 gap-3 anim-rise md:grid-cols-4">
+      {cards.map((c) => (
+        <Card key={c.label} className="text-center">
+          <span className={`mx-auto grid size-11 place-items-center rounded-2xl ${c.color}`}><Icon name={c.icon} size={20} /></span>
+          <p className="mt-2 text-2xl font-black text-coffee-900">{c.value}</p>
+          <p className="text-[11px] font-bold text-neutral-500">{c.label}</p>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+/* ============================ الطلبات ============================ */
+function OrdersTab({ token }: { token: string }) {
+  const [orders, setOrders] = useState<any[]>([]);
+  const [searchOrderNum, setSearchOrderNum] = useState('');
+  const seenRef = useRef<Set<number>>(new Set(JSON.parse(localStorage.getItem('dose_seen_orders') || '[]')));
+  const firstLoad = useRef(true);
+  const load = useCallback(async () => {
+    try {
+      const rows = await arpc<any[]>('admin_list_orders', { p_token: token, p_limit: 200 });
+      if (!Array.isArray(rows)) return;
+      if (!firstLoad.current) {
+        for (const o of rows) {
+          if (!seenRef.current.has(o.order_number) && o.status === 'pending') {
+            try {
+              if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+                new Notification('🔔 طلب جديد #' + o.order_number, {
+                  body: o.customer_name + ' — ' + eur(o.total_cents) + ' (' + (o.fulfillment_type === 'delivery' ? 'توصيل' : 'استلام') + ')',
+                  icon: '/logo.jpg', tag: 'order-' + o.id,
+                });
+              }
+            } catch {}
+          }
+        }
+      }
+      rows.forEach((o) => seenRef.current.add(o.order_number));
+      firstLoad.current = false;
+      localStorage.setItem('dose_seen_orders', JSON.stringify([...seenRef.current].slice(-500)));
+      setOrders(rows);
+    } catch {}
+  }, [token]);
+  useEffect(() => { load(); const t = setInterval(load, 10000); return () => clearInterval(t); }, [load]);
+const { busy, wrap } = useAdminAction();
+
+  /* عدد الطلبات الجديدة — يزيد مع وصول طلبات جديدة وينقص عند تحويل الطلب وإكماله */
+  const pendingCount = orders.filter((o) => o.status === 'pending').length;
+
+  /* وقت الطلب العام الذي ضبطه صاحب المحل من الإعدادات */
+  const [orderTimeMin, setOrderTimeMin] = useState(0);
+  useEffect(() => {
+    arpc<Record<string, string>>('admin_get_settings', { p_token: token })
+      .then((s) => setOrderTimeMin(Math.max(0, parseInt(s.order_time_minutes || '0', 10) || 0)))
+      .catch(() => {});
+  }, [token]);
+
+  /* الوقت المقدر للطلب = أقصى أوقات الأصناف (يُدخلها المالك لكل منتج) */
+  const orderEta = (o: any) => {
+    const fromItems = Math.max(0, ...((o.items ?? []) as any[]).map((it) => Number(it.eta_minutes) || 0));
+    return Math.max(orderTimeMin, fromItems > 0 ? fromItems : (Number(o.eta_minutes) || 0));
+  };
+
+  const setStatus = (id: string, status: string) => wrap(async () => {
+    await arpc('admin_set_order_status', { p_token: token, p_order_id: id, p_status: status });
+    load();
+  });
+
+  const STATUSES = ['pending', 'preparing', 'ready', 'out_for_delivery', 'completed'];
+  const filteredOrders = searchOrderNum
+    ? orders.filter((o) => String(o.order_number).includes(searchOrderNum))
+    : orders;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <h2 className="text-base font-extrabold text-coffee-900">الطلبات ({orders.length})</h2>
+          {/* أيقونة الإشعارات — عليها عدد الطلبات الجديدة */}
+          <span className="relative grid size-9 flex-none place-items-center rounded-2xl border-2 border-beige bg-[#FAF5EA]">
+            <Icon name="bell" size={17} className="text-coffee-800" />
+            {pendingCount > 0 && (
+              <span key={pendingCount} className="anim-pop absolute -top-2 -end-2 grid h-5 min-w-5 place-items-center rounded-full bg-[#C4482E] px-1 text-[10px] font-black text-white shadow">
+                {pendingCount > 99 ? '99+' : pendingCount}
+              </span>
+            )}
+          </span>
+          {pendingCount > 0 && (
+            <span key={'lbl' + pendingCount} className="anim-pop rounded-full bg-amber-400 px-2.5 py-1 text-[10px] font-black text-amber-950">
+              {pendingCount} طلب جديد
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={searchOrderNum}
+            onChange={(e) => setSearchOrderNum(e.target.value)}
+            placeholder="بحث برقم الطلب…"
+            className={`${inputCls} w-40`}
+            dir="ltr"
+          />
+          <button onClick={load} className={btnCls}>تحديث</button>
+        </div>
+      </div>
+      {filteredOrders.map((o) => (
+        <Card key={o.id} className={o.status === 'pending' ? '!ring-2 !ring-amber-400 !bg-amber-50/60 animate-pulse-slow' : ''}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <span className="text-sm font-black text-coffee-900">#{o.order_number}</span>
+              {o.status === 'pending' && <span className="ms-2 rounded-full bg-amber-400 px-2.5 py-1 text-[10px] font-black text-amber-950">جديد — بانتظار المعالجة</span>}
+              <span className={`ms-2 rounded-full px-2.5 py-1 text-[11px] font-extrabold ${statusChip(o.status)}`}>{statusLabel(o.status)}</span>
+              {o.points_awarded && <span className="ms-1 rounded-full bg-green-50 px-2 py-1 text-[10px] font-extrabold text-green-700">⭐ منحت</span>}
+              {['pending', 'preparing', 'ready', 'out_for_delivery'].includes(o.status) && (
+                orderEta(o) > 0
+                  ? <span className="ms-1 rounded-full bg-[#C9D3A8] px-2 py-1 text-[10px] font-extrabold text-[#26301C]">⏱️ {orderEta(o)} دقيقة</span>
+                  : o.estimated_delivery_at
+                    ? <span className="ms-1 rounded-full bg-[#C9D3A8] px-2 py-1 text-[10px] font-extrabold text-[#26301C]">⏱️ {new Date(o.estimated_delivery_at).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })}</span>
+                    : <span className="ms-1 rounded-full bg-[#EEF2DC] px-2 py-1 text-[10px] font-extrabold text-[#5C6B3C]">⏱️ {o.fulfillment_type === 'delivery' ? 'يوصل خلال 15-20 دقيقة' : 'جاهز خلال 5-10 دقيقة'}</span>
+              )}
+            </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] font-bold text-neutral-400">{fmtDateTimeNum(o.created_at)} · {o.source === 'kiosk' ? 'كشك المحل' : o.source === 'customer' ? 'تطبيق العميل' : 'إداري'}</span>
+                  {o.source === 'kiosk' && (o.is_reward || o.total_cents === 0 || o.reward_code) && <span className="rounded-full bg-[#EDE7FF] px-2 py-0.5 text-[9px] font-extrabold text-[#6D28D9]">مكافأة</span>}
+                </div>
+          </div>
+          <div className="mt-3 grid gap-3 text-xs md:grid-cols-4">
+            <div><p className="font-bold text-neutral-400">العميل</p><p className="mt-0.5 font-extrabold text-coffee-900">{o.customer_name}</p><p dir="ltr" className="text-neutral-500">{o.customer_phone}</p></div>
+            <div><p className="font-bold text-neutral-400">نوع الطلب</p><p className="mt-0.5 font-extrabold text-coffee-900">{o.fulfillment_type === 'delivery' ? '🚚 توصيل' : '🏪 استلام'}</p></div>
+              <div className="flex flex-col gap-1">
+              <span className="text-sm font-extrabold text-gold-deep">{eur(o.total_cents, 'ل.س')} · ⭐{o.total_points}</span>
+              {o.source === 'kiosk' && (o.is_reward || o.total_cents === 0 || o.reward_code) && <span className="inline-flex w-fit items-center rounded-full bg-[#EDE7FF] px-2 py-0.5 text-[9px] font-extrabold text-[#6D28D9]">طلب مكافأة من الكشك</span>}
+            </div>
+            <div className="flex flex-col gap-1.5">
+              {o.delivery_map_url && (
+                <a href={o.delivery_map_url} target="_blank" rel="noopener" className="rounded-xl bg-blue-50 px-3 py-2 text-center text-[11px] font-extrabold text-blue-700 hover:bg-blue-100">📍 فتح موقع العميل على الخريطة</a>
+              )}
+              <div className="flex flex-col gap-1">
+                <select value={o.status} disabled={busy} onChange={(e) => setStatus(o.id, e.target.value)}
+                  className="h-9 rounded-xl border-2 border-beige bg-[#FAF5EA] px-2 text-xs font-extrabold outline-none">
+                  {STATUSES.map((s) => <option key={s} value={s}>{statusLabel(s)}</option>)}
+                </select>
+              </div>
+            </div>
+          </div>
+          <div className="mt-2 flex flex-wrap gap-1.5 border-t border-dashed border-beige pt-2.5">
+            {o.items.map((it: any, i: number) => (
+              <span key={i} className="rounded-full bg-[#E3E9C8] px-3 py-1 text-[11px] font-bold text-neutral-600">{it.name_ar} × {it.qty}{Number(it.eta_minutes) > 0 ? ' ⏱️ ' + it.eta_minutes + ' دقيقة' : ''}</span>
+            ))}
+          </div>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+const statusLabel = (s: string) => ({ pending: 'قيد المراجعة', confirmed: 'مؤكد', preparing: 'قيد التحضير', ready: 'مكتمل', out_for_delivery: 'جاري التوصيل', completed: 'تم التسليم', cancelled: 'ملغي' } as any)[s] ?? s;
+const statusChip = (s: string) => ({ pending: 'bg-amber-100 text-amber-800', confirmed: 'bg-blue-100 text-blue-800', preparing: 'bg-orange-100 text-orange-800', ready: 'bg-emerald-100 text-emerald-800', out_for_delivery: 'bg-indigo-100 text-indigo-800', completed: 'bg-green-100 text-green-700', cancelled: 'bg-red-100 text-red-700' } as any)[s] ?? 'bg-neutral-100';
+
+/* ============================ المبيعات ============================ */
+type SalesRange = 'today' | 'week' | 'month' | 'custom';
+type SalesFilter = 'all' | 'app' | 'store' | 'gifts';
+
+/** شريط اختيار لأزرار الفترة/التصنيف — زر واحد محدد في كل مرة */
+function FilterPills<T extends string>({ value, options, onChange }: { value: T; options: { id: T; label: string; badge?: number }[]; onChange: (v: T) => void }) {
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {options.map((o) => (
+        <button key={o.id} onClick={() => onChange(o.id)}
+          className={`rounded-full px-3.5 py-1.5 text-[11px] font-extrabold transition ${value === o.id ? 'bg-coffee-900 text-cream shadow' : 'bg-[#EEF2DC] text-neutral-600 hover:bg-[#E3E9C8] hover:text-neutral-900'}`}>
+          {o.label}{typeof o.badge === 'number' && o.badge > 0 && (
+            <span className={`ms-1.5 rounded-full px-1.5 py-0.5 text-[9px] ${value === o.id ? 'bg-cream/20 text-cream' : 'bg-coffee-900/10 text-coffee-900'}`}>{o.badge}</span>
+          )}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** بطاقة رقم/إحصائية موحّدة لعرض ملخص المبيعات */
+function StatCard({ label, value, sub, tone, icon }: { 
+  label: string; value: string; sub: string; tone: string; icon?: React.ReactNode 
+}) {
+  return (
+    <div className={`relative rounded-3xl p-5 overflow-hidden ${tone}`}>
+      <div className="absolute inset-0 bg-gradient-to-br from-white/10 to-transparent" />
+      <div className="absolute left-0 top-0 bottom-0 w-1 bg-white/30" />
+      
+      <div className="relative flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[11px] font-black opacity-80 tracking-wide uppercase">{label}</p>
+          <p className="mt-1.5 text-2xl font-black tracking-tight">{value}</p>
+          <p className="mt-1 text-[10px] font-medium opacity-70">{sub}</p>
+        </div>
+        {icon && (
+          <div className="flex-shrink-0 size-12 rounded-xl bg-white/15 backdrop-blur-sm flex items-center justify-center text-white/90">
+            {icon}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SalesTab({ token }: { token: string }) {
+  const [range, setRange] = useState<SalesRange>('today');
+  const [from, setFrom] = useState<string>('');
+  const [to, setTo] = useState<string>('');
+  const [data, setData] = useState<any>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [salesFilter, setSalesFilter] = useState<SalesFilter>('all');
+
+  const todayStr = () => (new Date(Date.now() - new Date().getTimezoneOffset() * 60000)).toISOString().slice(0, 10);
+  const dates = (r: SalesRange) => {
+    const d = new Date(Date.now() - new Date().getTimezoneOffset() * 60000);
+    if (r === 'today') return [todayStr(), todayStr()];
+    if (r === 'week') { const w = new Date(d.getTime() - 6 * 86400000); return [w.toISOString().slice(0, 10), todayStr()]; }
+    if (r === 'month') { const m = new Date(d.getFullYear(), d.getMonth(), 1); return [m.toISOString().slice(0, 10), todayStr()]; }
+    return [from, to];
+  };
+
+  const load = useCallback(async () => {
+    if (range === 'custom' && (!from || !to)) { setLoaded(false); return; }
+    const [f, t] = dates(range);
+    if (!f || !t) return;
+    try {
+      const r = await arpc<any>('admin_sales_report', { p_token: token, p_from: f, p_to: t });
+      setData(r); setLoaded(true);
+    } catch { setLoaded(false); }
+  }, [token, range, from, to]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const isReward = (o: any) => !!(o.is_reward || o.total_cents === 0 || o.reward_code || o.promo_type === 'reward');
+  const ordersAll = (data?.orders ?? []) as any[];
+
+  const filterOpts: { id: SalesFilter; label: string }[] = [
+    { id: 'all', label: 'الكل' },
+    { id: 'app', label: 'طلبات التطبيق' },
+    { id: 'store', label: 'طلبات المحل' },
+    { id: 'gifts', label: 'هدايا' },
+  ];
+  // عدد الطلبات لكل تصنيف (من كل الطلبات، قبل بحث العميل/الحالة)
+  const filterCount = (id: SalesFilter) => ordersAll.filter((o) => {
+    if (id === 'app') return !isReward(o) && o.source === 'customer';
+    if (id === 'store') return !isReward(o) && o.source === 'kiosk';
+    if (id === 'gifts') return isReward(o);
+    return true;
+  }).length;
+
+  const filteredOrders = ordersAll.filter((o) => {
+    // 1) تصنيف المبيعات
+    if (salesFilter === 'app' && (isReward(o) || o.source !== 'customer')) return false;
+    if (salesFilter === 'store' && (isReward(o) || o.source !== 'kiosk')) return false;
+    if (salesFilter === 'gifts' && !isReward(o)) return false;
+    return true;
+  });
+
+  const totals = {
+    total: filteredOrders.reduce((s, o) => s + Number(o.total_cents ?? 0), 0),
+    orders: filteredOrders.length,
+    app: filteredOrders.filter((o) => o.source === 'customer' && !isReward(o)).length,
+    store: filteredOrders.filter((o) => o.source === 'kiosk' && !isReward(o)).length,
+    gifts: filteredOrders.filter(isReward).length,
+  };
+
+  const num = (v: any) => Number(v ?? 0).toLocaleString('en-US');
+  const money = (v: any) => num(v) + ' ل.س';
+  const daily = (data?.daily ?? []) as { day: string; total_cents: number; orders_count: number }[];
+  const max = Math.max(1, ...daily.map((d) => d.total_cents));
+  const products = (data?.products ?? []) as { name_ar: string; qty: number; revenue_cents: number }[];
+
+  // خيارات الفترة مع أسماء المدى الحالي
+  const ranges: { id: SalesRange; label: string }[] = [
+    { id: 'today', label: 'اليوم' },
+    { id: 'week', label: 'آخر 7 أيام' },
+    { id: 'month', label: 'هذا الشهر' },
+    { id: 'custom', label: 'فترة مخصصة' },
+  ];
+  const periodLabel = range === 'today' ? 'اليوم' : range === 'week' ? 'آخر 7 أيام' : range === 'month' ? 'هذا الشهر' : (data ? data.from + ' — ' + data.to : '');
+  const activeFilterCount = (salesFilter !== 'all' ? 1 : 0);
+  const clearFilters = () => { setSalesFilter('all'); };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <h2 className="text-base font-extrabold text-coffee-900">المبيعات والجرد</h2>
+          {loaded && data && <span className="rounded-full bg-[#EEF2DC] px-2.5 py-1 text-[10px] font-black text-[#5C6B3C]">{periodLabel}</span>}
+        </div>
+        <button onClick={load} className={btnCls}>تحديث</button>
+      </div>
+
+      {/* الفترة الزمنية */}
+      <div className="rounded-2xl bg-white p-3 ring-1 ring-beige">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-[11px] font-black text-neutral-500">الفترة:</span>
+          <FilterPills<SalesRange> value={range} options={ranges} onChange={setRange} />
+        </div>
+        {range === 'custom' && (
+          <div className="mt-3 flex flex-wrap items-end gap-3">
+            <Field label="من تاريخ"><input type="date" className={`${inputCls} sm:w-44`} dir="ltr" value={from} onChange={(e) => setFrom(e.target.value)} /></Field>
+            <Field label="إلى تاريخ"><input type="date" className={`${inputCls} sm:w-44`} dir="ltr" value={to} onChange={(e) => setTo(e.target.value)} /></Field>
+          </div>
+        )}
+      </div>
+
+      {/* الفلترة: تصنيف المبيعات */}
+      <div className="space-y-3 rounded-2xl bg-white p-3 ring-1 ring-beige">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-[11px] font-black text-neutral-500">تصفية النتائج{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}:</span>
+          <div className="flex items-center gap-2">
+            {activeFilterCount > 0 && (
+              <button onClick={clearFilters} className="rounded-full bg-[#E3E9C8] px-3 py-1.5 text-[10px] font-extrabold text-neutral-700 hover:bg-[#D6DDB8]">مسح الفلاتر</button>
+            )}
+          </div>
+        </div>
+        <FilterPills<SalesFilter> value={salesFilter} options={filterOpts.map((f) => ({ ...f, badge: filterCount(f.id) }))} onChange={setSalesFilter} />
+      </div>
+
+      {loaded && data ? (
+        <>
+          {/* أرقام الفترة (حسب التصفية الحالية) */}
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+            <StatCard label="إجمالي المبيعات" value={money(totals.total)} sub={periodLabel} tone="bg-gradient-to-br from-[#414D36] via-[#35412E] to-[#23291B]" icon={<Icon name="chart" size={20} />} />
+            <StatCard label="عدد الطلبات" value={num(totals.orders)} sub={'خلال ' + num(data.totals?.days) + ' يوم'} tone="bg-gradient-to-br from-[#5C6B3C] via-[#4A5A36] to-[#3A4828]" icon={<Icon name="receipt" size={20} />} />
+            <StatCard label="طلبات التطبيق" value={num(totals.app)} sub="طلب من التطبيق" tone="bg-gradient-to-br from-[#3B82F6] via-[#2563EB] to-[#1E40AF]" icon={<Icon name="phone" size={20} />} />
+            <StatCard label="طلبات المحل" value={num(totals.store)} sub="طلب من المحل" tone="bg-gradient-to-br from-[#C9A96A] via-[#B8965A] to-[#A08448]" icon={<Icon name="store" size={20} />} />
+            <StatCard label="هدايا" value={num(totals.gifts)} sub="طلب مكافأة" tone="bg-gradient-to-br from-[#7C3AED] via-[#6D28D9] to-[#5B21B6]" icon={<Icon name="gift" size={20} />} />
+          </div>
+
+          {activeFilterCount > 0 && (
+            <p className="rounded-xl bg-[#FFF9EC] px-3 py-2 text-[10.5px] font-bold text-[#8A6D2F]">
+              الأرقام أعلاه أدناه تعكس التصفية الحالية ({filteredOrders.length} طلب). الجدول والرسم يعرضان كامل الفترة.
+            </p>
+          )}
+
+          {/* مبيعات يومية */}
+          <Card className="p-5">
+            <div className="mb-3 flex items-center justify-between">
+              <p className="text-xs font-extrabold text-coffee-900">المبيعات اليومية</p>
+              <span className="text-[10px] font-bold text-neutral-400">القيم بـ (ل.س) — بعدد الطلبات</span>
+            </div>
+            <div className="flex items-end gap-1.5 overflow-x-auto pb-1" dir="ltr">
+              {daily.map((d) => (
+                <div key={d.day} className="flex min-w-[40px] flex-1 flex-col items-center gap-1.5">
+                  <span className="text-[8.5px] font-black text-neutral-500">{d.total_cents > 0 ? (d.total_cents / 1000).toLocaleString('en-US') + 'k' : ''}</span>
+                  <div className="w-full rounded-t-lg bg-gradient-to-t from-[#5C6B3C] to-[#A9B87F] transition-all" style={{ height: `${d.total_cents > 0 ? 10 + Math.round((d.total_cents / max) * 90) : 3}px` }} />
+                  <span className="text-[8px] font-bold text-neutral-400">{d.day.slice(5)}</span>
+                  <span className="text-[8px] font-black text-neutral-600">{d.orders_count > 0 ? d.orders_count : ''}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          {/* جرد المنتجات */}
+          <Card className="p-5">
+            <div className="mb-3 flex items-center justify-between">
+              <p className="text-xs font-extrabold text-coffee-900">جرد المنتجات المباعة في الفترة</p>
+              <span className="text-[10px] font-bold text-neutral-400">مرتّبة حسب الإيراد</span>
+            </div>
+            {products.length === 0 ? (
+              <p className="py-6 text-center text-xs font-bold text-neutral-400">لا توجد أصناف في هذه الفترة</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-right text-xs">
+                  <thead>
+                    <tr className="border-b border-beige text-[10px] font-black text-neutral-400">
+                      <th className="pb-2">الصنف</th>
+                      <th className="pb-2 text-center">العدد</th>
+                      <th className="pb-2 text-left">الإيراد</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {products.map((p, i) => (
+                      <tr key={i} className="border-b border-dashed border-beige last:border-0">
+                        <td className="py-2 font-extrabold text-coffee-900">{p.name_ar}</td>
+                        <td className="py-2 text-center font-black text-[#5C6B3C]">{p.qty}</td>
+                        <td className="py-2 text-left font-extrabold text-gold-deep">{money(p.revenue_cents)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+
+          {/* جدول الطلبات المفصّل — يعكس التصفية */}
+          <Card className="p-5">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs font-extrabold text-coffee-900">تفاصيل الطلبات ({filteredOrders.length})</p>
+              <div className="flex items-center gap-2">
+                <span className="rounded-full bg-[#3B82F6] px-2 py-0.5 text-[9px] font-black text-white">تطبيق</span>
+                <span className="rounded-full bg-[#C9A96A] px-2 py-0.5 text-[9px] font-black text-white">محل</span>
+                <span className="rounded-full bg-[#EDE7FF] px-2 py-0.5 text-[9px] font-black text-[#6D28D9]">هدايا</span>
+              </div>
+            </div>
+            {filteredOrders.length === 0 ? (
+              <p className="py-6 text-center text-xs font-bold text-neutral-400">لا توجد طلبات مطابقة لهذه التصفية</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-right text-xs">
+                  <thead>
+                    <tr className="border-b border-beige text-[10px] font-black text-neutral-400">
+                      <th className="pb-2">رقم</th>
+                      <th className="pb-2">العميل</th>
+                      <th className="pb-2 text-center">الإجمالي</th>
+                      <th className="pb-2 text-center">الحالة</th>
+                      <th className="pb-2">المصدر</th>
+                      <th className="pb-2">الوقت</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredOrders.map((o: any) => {
+                      const reward = isReward(o);
+                      return (
+                        <tr key={o.id} className={reward ? "border-b border-dashed border-[#D6C6FF] bg-[#F6F3FF]" : "border-b border-dashed border-beige bg-[#FFF9EC]"}>
+                          <td className="py-2 font-mono font-black text-coffee-900" dir="ltr">#{o.order_number}</td>
+                          <td className="py-2">
+                            <div className="font-bold text-coffee-900">{o.customer_name || '—'}</div>
+                            <div dir="ltr" className="text-[10px] text-neutral-400">{o.customer_phone || ''}</div>
+                          </td>
+                          <td className="py-2 text-center font-black text-gold-deep">{reward ? 'مجاني' : money(o.total_cents)}</td>
+                          <td className="py-2 text-center">
+                            {reward ? (
+                              <span className="rounded-full px-2 py-0.5 text-[9px] font-extrabold bg-[#EDE7FF] text-[#6D28D9]">مكافأة</span>
+                            ) : (
+                              <span className={`rounded-full px-2 py-0.5 text-[9px] font-extrabold ${o.status === 'ready' ? 'bg-emerald-100 text-emerald-700' : o.status === 'completed' ? 'bg-neutral-100 text-neutral-500' : 'bg-red-50 text-red-500'}`}>
+                                {statusLabel(o.status)}
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2">
+                            <span className="rounded-full px-2 py-0.5 text-[9px] font-bold bg-[#FAF5EA] text-neutral-500 ring-1 ring-beige">
+                              {o.source === 'kiosk' ? 'طلبات المحل' : o.source === 'customer' ? 'طلبات التطبيق' : 'إداري'}
+                            </span>
+                          </td>
+                          <td className="py-2 text-[10px] font-bold text-neutral-400">{fmtDateTimeNum(o.created_at)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+
+          <p className="rounded-xl bg-[#EEF2DC] px-3 py-2 text-[10.5px] font-bold leading-relaxed text-[#77825E]">
+            الطلبات المُسلَّمة تُحذف تلقائيًا بعد يوم من تسليمها للزبون — لكن مبالغها تبقى محسوبة في الإجماليات. جرد الأصناف يظهر من الطلبات المحفوظة حاليًا، والمبالغ المعروضة تشمل الطلبات الحاملة حالة «مكتمل» أو «تم التسليم».
+          </p>
+        </>
+      ) : (
+        <Card className="p-8"><p className="text-center text-xs font-bold text-neutral-400">اختر فترة لعرض التقرير</p></Card>
+      )}
+    </div>
+  );
+}
+
+/* ============================ المنتجات ============================ */
+const EMPTY_PRODUCT = { id: 0, category_slug: 'hot_drinks', name_ar: '', name_en: '', description_ar: '', price_cents: 0, points: 0, image_url: '', options: '', is_active: true, is_available: true, sort_order: 0, eta_minutes: 0, menu_id: null };
+const EMPTY_ADD = { id: 0, name_ar: '', price_cents: '', price_mode: 'add', is_active: true, product_ids: [] };
+function ProductsTab({ token }: { token: string }) {
+  const [products, setProducts] = useState<any[]>([]);
+  const [cats, setCats] = useState<any[]>([]);
+  const [menus, setMenus] = useState<any[]>([]);
+  const [edit, setEdit] = useState<any>(null);
+  const [offerId, setOfferId] = useState<number | null>(null);
+  const [offerVal, setOfferVal] = useState('');
+  const load = useCallback(() => { arpc<any[]>('admin_list_products', { p_token: token }).then(setProducts).catch(() => {}); }, [token]);
+  const loadMenus = useCallback(() => { arpc<any[]>('admin_list_menus', { p_token: token }).then(setMenus).catch(() => {}); }, [token]);
+  useEffect(() => { load(); loadMenus(); }, [load, loadMenus]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await sb.rpc('get_catalog');
+        setCats((data as any)?.categories ?? []);
+        setMenus((data as any)?.menus ?? []);
+      } catch {}
+    })();
+  }, []);
+  const { busy, wrap } = useAdminAction();
+
+  const save = () => wrap(async () => {
+    await arpc('admin_save_product', { p_token: token, p_product: edit });
+    setEdit(null); load();
+  });
+
+  /* بحث في المنتجات: بالاسم (عربي/إنجليزي) أو التصنيف */
+  const [q, setQ] = useState('');
+  const needle = q.trim().toLowerCase();
+  const catName = (slug: string) => cats.find((c: any) => c.slug === slug)?.name_ar ?? slug;
+  const shown = needle
+    ? products.filter((p) =>
+        (p.name_ar ?? '').toLowerCase().includes(needle) ||
+        (p.name_en ?? '').toLowerCase().includes(needle) ||
+        (p.category_slug ?? '').toLowerCase().includes(needle) ||
+        catName(p.category_slug).includes(q.trim()))
+    : products;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h2 className="text-base font-extrabold text-coffee-900">المنتجات ({products.length})</h2>
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="بحث عن منتج أو تصنيف…"
+            className={`${inputCls} w-52`}
+          />
+          <button onClick={load} className={btnCls}>تحديث</button>
+          <button onClick={() => setEdit({ ...EMPTY_PRODUCT })} className={btnCls}>+ منتج جديد</button>
+        </div>
+      </div>
+      {needle && <p className="text-[11px] font-bold text-neutral-400">{shown.length} نتيجة مطابقة</p>}
+      <div className="grid gap-3 md:grid-cols-2">
+        {shown.map((p) => (
+          <Card key={p.id} className={`flex gap-3 ${p.is_active ? '' : 'opacity-50'}`}>
+            <img src={p.image_url} alt="" className="size-20 rounded-2xl object-cover" />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-extrabold text-coffee-900">{p.name_ar} <span className="text-[10px] font-bold text-neutral-400">{p.name_en}</span></p>
+              <p className="mt-0.5 text-xs text-neutral-500">{p.description_ar}</p>
+              <p className="mt-1 text-xs font-extrabold text-gold-deep">
+                {p.sale_price_cents != null ? (
+                  <>
+                    <span className="me-1 rounded-full bg-[#C4482E] px-2 py-0.5 text-[9px] font-black text-white">عرض</span>
+                    {eur(p.sale_price_cents, 'ل.س')} <span className="font-bold text-neutral-400 line-through">{eur(p.price_cents, 'ل.س')}</span>
+                  </>
+                ) : eur(p.price_cents, 'ل.س')}
+                {' '}· ⭐ {p.points}
+              </p>
+              <p className="text-[10px] font-bold text-neutral-400">تصنيف: {catName(p.category_slug)}</p>
+              {Number(p.eta_minutes) > 0 && (
+                <span className="mt-1 inline-flex items-center gap-1 rounded-full bg-[#FFF9EC] px-2.5 py-1 text-[10px] font-extrabold text-[#7A5A22] ring-1 ring-[#EAD3A0]">
+                  ⏱️ {p.eta_minutes} دقيقة
+                </span>
+              )}
+              <div className="mt-2 flex gap-2">
+                <button onClick={() => setEdit({ ...EMPTY_PRODUCT, ...p, category_slug: p.category_slug })} className="rounded-lg bg-[#E3E9C8] px-3 py-1.5 text-[11px] font-extrabold text-neutral-700">تعديل</button>
+                <button disabled={busy} onClick={() => wrap(async () => { await arpc('admin_set_product_availability', { p_token: token, p_product_id: p.id, p_available: p.is_available === false }); load(); })}
+                  className={`rounded-lg px-3 py-1.5 text-[11px] font-extrabold ${p.is_available === false ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
+                  {p.is_available === false ? 'غير متوفر' : 'متوفر'}
+                </button>
+                <button disabled={busy} onClick={() => { setOfferId(offerId === p.id ? null : p.id); setOfferVal(p.sale_price_cents != null ? String(p.sale_price_cents) : ''); }}
+                  className={`rounded-lg px-3 py-1.5 text-[11px] font-extrabold ${p.sale_price_cents != null ? 'bg-[#C4482E] text-white' : 'bg-[#F1DCB0] text-[#7A5A22]'}`}>
+                  عرض
+                </button>
+                <button disabled={busy} onClick={() => wrap(async () => {
+                  if (!window.confirm('حذف نهائي للمنتج «' + p.name_ar + '»؟\nسيُحذف من القائمة والمنتجات المقترحة، وتبقى الطلبات السابقة كما هي.')) return;
+                  await arpc('admin_delete_product', { p_token: token, p_id: p.id }); load();
+                })}
+                  className="rounded-lg bg-red-50 px-3 py-1.5 text-[11px] font-extrabold text-red-600">حذف نهائي</button>
+              </div>
+              {offerId === p.id && (
+                <div className="mt-2 rounded-xl bg-[#FFF9EC] p-3 ring-1 ring-[#EAD3A0]">
+                  <p className="text-[10px] font-black text-[#7A5A22]">السعر الجديد (ل.س) — القديم يُمشَّط ويظهر شارة «عرض» للزبون</p>
+                  <div className="mt-2 flex gap-2">
+                    <input type="number" className={inputCls} value={offerVal} onChange={(e) => setOfferVal(e.target.value)} placeholder="مثال: 12000" />
+                    <button disabled={busy || !offerVal} onClick={() => wrap(async () => { await arpc('admin_set_product_sale', { p_token: token, p_product_id: p.id, p_sale_cents: Number(offerVal) }); setOfferId(null); load(); })}
+                      className="flex-none rounded-lg bg-[#414D36] px-3 py-1.5 text-[11px] font-extrabold text-[#C9D3A8]">حفظ</button>
+                    {p.sale_price_cents != null && (
+                      <button disabled={busy} onClick={() => wrap(async () => { await arpc('admin_set_product_sale', { p_token: token, p_product_id: p.id, p_sale_cents: null }); setOfferId(null); load(); })}
+                        className="flex-none rounded-lg bg-red-50 px-3 py-1.5 text-[11px] font-extrabold text-red-600">إزالة العرض</button>
+                    )}
+                    <button onClick={() => setOfferId(null)} className="flex-none rounded-lg bg-neutral-100 px-3 py-1.5 text-[11px] font-extrabold text-neutral-600">إلغاء</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      {edit && (
+        <div className="fixed inset-0 z-[110] grid place-items-center bg-black/50 p-4 backdrop-blur-sm anim-fade">
+          <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-3xl bg-white p-6 shadow-2xl anim-pop">
+            <h3 className="text-base font-extrabold text-coffee-900">{edit.id ? 'تعديل منتج' : 'منتج جديد'}</h3>
+            <div className="mt-4 space-y-3">
+              <Field label="الاسم بالعربية"><input className={inputCls} value={edit.name_ar} onChange={(e) => setEdit({ ...edit, name_ar: e.target.value })} /></Field>
+              <Field label="الاسم بالإنجليزية"><input className={inputCls} dir="ltr" value={edit.name_en} onChange={(e) => setEdit({ ...edit, name_en: e.target.value })} /></Field>
+              <Field label="الوصف"><textarea className={`${inputCls} h-20 py-2`} value={edit.description_ar} onChange={(e) => setEdit({ ...edit, description_ar: e.target.value })} /></Field>
+              <Field label="خيارات الذوق (افصل بفاصلة)"><input className={inputCls} value={edit.options || ''} onChange={(e) => setEdit({ ...edit, options: e.target.value })} placeholder="سكر إضافي، بدون سكر، نعناع" /></Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="السعر (ل.س)"><input type="number" className={inputCls} value={edit.price_cents} onChange={(e) => setEdit({ ...edit, price_cents: +e.target.value })} /></Field>
+                <Field label="النقاط"><input type="number" className={inputCls} value={edit.points} onChange={(e) => setEdit({ ...edit, points: +e.target.value })} /></Field>
+              </div>
+              <Field label="صورة المنتج"><ImageUploadField value={edit.image_url} onChange={(url) => setEdit({ ...edit, image_url: url })} folder="products" /></Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="التصنيف (الفئة)">
+                  <select className={inputCls} value={edit.category_slug || ''} onChange={(e) => setEdit({ ...edit, category_slug: e.target.value })}>
+                    <option value="">— اختر الفئة —</option>
+                    {cats.map((c: any) => <option key={c.slug} value={c.slug}>{c.name_ar}</option>)}
+                  </select>
+                </Field>
+                <Field label="القائمة (اختياري)">
+                  <select className={inputCls} value={edit.menu_id || ''} onChange={(e) => {
+                    const mid = e.target.value ? Number(e.target.value) : null;
+                    const m = menus.find((mm: any) => mm.id === mid);
+                    setEdit((prev: any) => ({ ...prev, menu_id: mid, category_slug: m?.category_slug || prev.category_slug }));
+                  }}>
+                    <option value="">— بدون قائمة —</option>
+                    {menus.map((m: any) => <option key={m.id} value={m.id}>{m.emoji ? m.emoji + ' ' : ''}{m.title}</option>)}
+                  </select>
+                </Field>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="نشط">
+                  <select className={inputCls} value={String(edit.is_active)} onChange={(e) => setEdit({ ...edit, is_active: e.target.value === 'true' })}>
+                    <option value="true">نعم</option><option value="false">لا</option>
+                  </select>
+                </Field>
+                <Field label="التوفر">
+                  <select className={inputCls} value={String(edit.is_available !== false)} onChange={(e) => setEdit({ ...edit, is_available: e.target.value === 'true' })}>
+                    <option value="true">متوفر</option>
+                    <option value="false">غير متوفر</option>
+                  </select>
+                </Field>
+              </div>
+            </div>
+            <div className="mt-5 grid grid-cols-2 gap-3">
+              <button onClick={save} disabled={busy} className="rounded-2xl bg-gradient-to-l from-gold to-gold-deep py-3 text-sm font-extrabold text-white shadow disabled:opacity-50">حفظ</button>
+              <button onClick={() => setEdit(null)} className="rounded-2xl bg-neutral-100 py-3 text-sm font-extrabold text-neutral-600">إلغاء</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================ العملاء ============================ */
+function CustomersTab({ token }: { token: string }) {
+  const [rows, setRows] = useState<any[]>([]);
+  const [q, setQ] = useState('');
+  const load = useCallback(() => { arpc<any[]>('admin_list_customers', { p_token: token }).then(setRows).catch(() => {}); }, [token]);
+  useEffect(() => { load(); }, [load]);
+  const { busy, wrap } = useAdminAction();
+  const filtered = rows.filter((r) => r.full_name.includes(q) || r.phone.includes(q));
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-base font-extrabold text-coffee-900">العملاء ({rows.length})</h2>
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="بحث بالاسم أو الهاتف…" className={`${inputCls} max-w-xs`} />
+      </div>
+      <Card className="overflow-x-auto p-0">
+        <table className="w-full text-right text-xs">
+          <thead><tr className="border-b border-beige text-neutral-400">
+            <th className="p-3 font-extrabold">الاسم</th><th className="p-3 font-extrabold">الهاتف</th>
+            <th className="p-3 font-extrabold">الطلبات</th><th className="p-3 font-extrabold">النقاط</th>
+            <th className="p-3 font-extrabold">المكافآت</th><th className="p-3 font-extrabold">الحالة</th><th className="p-3"></th>
+          </tr></thead>
+          <tbody>
+            {filtered.map((c) => (
+              <tr key={c.id} className="border-b border-beige/50">
+                <td className="p-3 font-extrabold text-coffee-900">{c.full_name}</td>
+                <td className="p-3" dir="ltr">{c.phone}</td>
+                <td className="p-3">{c.orders_count}</td>
+                <td className="p-3 font-black text-gold-deep">⭐ {c.points}</td>
+                <td className="p-3">{c.redemptions}</td>
+                <td className="p-3">
+                  <span className={`rounded-full px-2 py-1 text-[10px] font-extrabold ${c.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-600'}`}>{c.is_active ? 'نشط' : 'موقوف'}</span>
+                </td>
+                <td className="p-3">
+                  <button disabled={busy} onClick={() => wrap(async () => { await arpc('admin_toggle_customer', { p_token: token, p_customer_id: c.id, p_active: !c.is_active }); load(); })}
+                    className="rounded-lg bg-[#E3E9C8] px-3 py-1.5 text-[10px] font-extrabold text-neutral-700">{c.is_active ? 'إيقاف' : 'تنشيط'}</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================ المكافآت ============================ */
+const EMPTY_REWARD = { id: 0, name_ar: '', name_en: '', image_url: '/img/latte.jpg', points_cost: 50, is_active: true, sort_order: 0, expires_at: '', redemption_days: '' };
+/* ============================ القوائم ============================ */
+const EMPTY_MENU = { id: 0, title: '', subtitle: '', image_url: '', emoji: '☕', is_active: true, sort_order: 0, product_ids: [] as number[] };
+function MenusTab({ token }: { token: string }) {
+  const [menus, setMenus] = useState<any[]>([]);
+  const [products, setProducts] = useState<any[]>([]);
+  const [cats, setCats] = useState<any[]>([]);
+  const [edit, setEdit] = useState<any>(null);
+  const [pickQ, setPickQ] = useState('');
+  const [pickCat, setPickCat] = useState('');
+  const [listQ, setListQ] = useState('');
+  const load = useCallback(() => { arpc<any[]>('admin_list_menus', { p_token: token }).then(setMenus).catch(() => {}); }, [token]);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await sb.rpc('get_catalog');
+        setProducts((data as any)?.products ?? []);
+        setCats((data as any)?.categories ?? []);
+      } catch {}
+    })();
+  }, []);
+  const { busy, wrap } = useAdminAction();
+
+  const pName = (id: number) => products.find((p) => p.id === id)?.name_ar ?? ('#' + id);
+  const togglePick = (pid: number) => setEdit((e: any) => {
+    const ids: number[] = e.product_ids ?? [];
+    return { ...e, product_ids: ids.includes(pid) ? ids.filter((x) => x !== pid) : [...ids, pid] };
+  });
+
+  const catName = (slug: string) => cats.find((c: any) => c.slug === slug)?.name_ar ?? slug;
+  const needle = pickQ.trim().toLowerCase();
+  const pickable = products.filter((p) => {
+    if (pickCat && p.category !== pickCat) return false;
+    if (!needle) return true;
+    return (p.name_ar ?? '').toLowerCase().includes(needle) || (p.name_en ?? '').toLowerCase().includes(needle);
+  });
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h2 className="text-base font-extrabold text-coffee-900">القوائم ({menus.length})</h2>
+        <div className="flex items-center gap-2">
+          <input value={listQ} onChange={(e) => setListQ(e.target.value)} placeholder="بحث في القوائم…" className={`${inputCls} w-44`} />
+          <button onClick={() => { setEdit({ ...EMPTY_MENU }); setPickQ(''); setPickCat(''); }} className={btnCls}>+ قائمة جديدة</button>
+        </div>
+      </div>
+      <p className="text-[11px] font-bold text-neutral-500"> Manshaq List (مثل: قائمة الإفطار أو الأكثر رواجًا) واختر المنتجات التي تظهر فيها — تظهر للز/Page principal</p>
+
+      <div className="grid gap-3 md:grid-cols-2">
+        {menus.filter((m) => !listQ.trim() || (m.title ?? '').toLowerCase().includes(listQ.trim().toLowerCase()) || (m.subtitle ?? '').toLowerCase().includes(listQ.trim().toLowerCase())).map((m) => (
+          <Card key={m.id} className={m.is_active ? '' : 'opacity-50'}>
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-sm font-extrabold text-coffee-900">{m.emoji} {m.title}
+                  <span className={`ms-2 rounded-full px-2 py-0.5 text-[9px] font-black ${m.is_active ? 'bg-[#D5DEB4] text-[#414D36]' : 'bg-neutral-100 text-neutral-500'}`}>
+                    {m.is_active ? 'معروضة' : 'مخفيّة'}
+                  </span>
+                </p>
+                {m.subtitle && <p className="mt-0.5 text-[11px] font-bold text-neutral-500">{m.subtitle}</p>}
+              </div>
+            </div>
+            <p className="mt-1.5 text-[10.5px] font-bold text-neutral-400">
+              {(m.product_ids ?? []).length === 0
+                ? 'لا منتجات بعد'
+                : (m.product_ids ?? []).length + ' منتجات: ' + (m.product_ids ?? []).map(pName).slice(0, 4).join('، ') + ((m.product_ids ?? []).length > 4 ? '…' : '')}
+            </p>
+            <div className="mt-2 flex gap-2">
+              <button onClick={() => { setEdit({ ...m, product_ids: m.product_ids ?? [] }); setPickQ(''); setPickCat(''); }}
+                className="rounded-lg bg-[#E3E9C8] px-3 py-1.5 text-[11px] font-extrabold text-neutral-700">تعديل</button>
+              <button disabled={busy} onClick={() => wrap(async () => {
+                if (!window.confirm('حذف القائمة «' + m.title + '» نهائيًا؟')) return;
+                await arpc('admin_delete_menu', { p_token: token, p_id: m.id });
+                load();
+              })} className="rounded-lg bg-red-50 px-3 py-1.5 text-[11px] font-extrabold text-red-600">حذف</button>
+            </div>
+          </Card>
+        ))}
+        {menus.length === 0 && (
+          <p className="rounded-2xl bg-[#F6F0E2] p-6 text-center text-xs font-bold text-neutral-400">لا توجد قوائم بعد — ابدأ بقائمة جديدة</p>
+        )}
+      </div>
+
+      {edit && (
+        <div className="fixed inset-0 z-[110] grid place-items-center bg-black/50 p-4 backdrop-blur-sm anim-fade">
+          <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-3xl bg-white p-6 shadow-2xl anim-pop">
+            <h3 className="text-base font-extrabold text-coffee-900">{edit.id ? 'تعديل قائمة' : 'قائمة جديدة'}</h3>
+            <div className="mt-4 space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="اسم القائمة"><input className={inputCls} value={edit.title} onChange={(e) => setEdit({ ...edit, title: e.target.value })} placeholder="مثال: قائمة الإفطار" /></Field>
+                <Field label="رمز تعبيري"><input className={inputCls} value={edit.emoji} onChange={(e) => setEdit({ ...edit, emoji: e.target.value })} placeholder="☕" /></Field>
+              </div>
+              <Field label="صورة القائمة (اختياري)"><ImageUploadField value={edit.image_url} onChange={(url) => setEdit({ ...edit, image_url: url })} folder="menus" /></Field>
+              <Field label="معروضة للزبائن">
+                <select className={inputCls} value={String(edit.is_active)} onChange={(e) => setEdit({ ...edit, is_active: e.target.value === 'true' })}>
+                  <option value="true">نعم</option><option value="false">لا</option>
+                </select>
+              </Field>
+              <Field label="التصنيف (الفئة التي تظهر فيها القائمة)">
+                <select className={inputCls} value={edit.category_slug || 'hot_drinks'} onChange={(e) => setEdit({ ...edit, category_slug: e.target.value })}>
+                  {cats.map((c: any) => <option key={c.slug} value={c.slug}>{c.name_ar}</option>)}
+                </select>
+              </Field>
+
+               <Field label={`منتجات القائمة (${(edit.product_ids ?? []).length})`}>
+                 <div className="space-y-2">
+                   <div className="flex flex-col gap-2 sm:flex-row">
+                     <input value={pickQ} onChange={(e) => setPickQ(e.target.value)} placeholder="ابحث عن منتج…" className={`${inputCls} w-full sm:flex-1`} />
+                     <select value={pickCat} onChange={(e) => setPickCat(e.target.value)} className={`${inputCls} w-full sm:w-36`}>
+                       <option value="">كل التصنيفات</option>
+                       {cats.map((c: any) => <option key={c.slug} value={c.slug}>{c.name_ar}</option>)}
+                     </select>
+                   </div>
+                  <div className="max-h-64 space-y-0.5 overflow-y-auto rounded-xl border-2 border-beige p-2">
+                    {pickable.map((p) => (
+                      <label key={p.id} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs font-bold text-neutral-700 hover:bg-[#F6F0E2]">
+                        <input type="checkbox" checked={(edit.product_ids ?? []).includes(p.id)} onChange={() => togglePick(p.id)} />
+                        <span className="truncate">{p.name_ar}</span>
+                        <span className="ms-auto flex-none text-[10px] font-bold text-neutral-400">{catName(p.category)}</span>
+                      </label>
+                    ))}
+                    {pickable.length === 0 && <p className="py-4 text-center text-[11px] font-bold text-neutral-400">لا نتائج</p>}
+                  </div>
+                  {(edit.product_ids ?? []).length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {(edit.product_ids as number[]).map((id) => (
+                        <span key={id} className="flex items-center gap-1 rounded-full bg-[#E3E9C8] px-2.5 py-1 text-[10px] font-bold text-neutral-700">
+                          {pName(id)}
+                          <button onClick={() => togglePick(id)} className="text-[#C4482E]" aria-label="إزالة">×</button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </Field>
+            </div>
+            <div className="mt-5 grid grid-cols-2 gap-3">
+              <button disabled={busy || !edit.title?.trim()} onClick={() => wrap(async () => {
+                await arpc('admin_save_menu', { p_token: token, p_menu: { ...edit, product_ids: edit.product_ids ?? [] } });
+                setEdit(null); load();
+              })}
+                className="rounded-2xl bg-gradient-to-l from-gold to-gold-deep py-3 text-sm font-extrabold text-white disabled:opacity-50">حفظ</button>
+              <button onClick={() => setEdit(null)} className="rounded-2xl bg-neutral-100 py-3 text-sm font-extrabold text-neutral-600">إلغاء</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================ الإضافات المدفوعة ============================ */
+function ExtrasTab({ token }: { token: string }) {
+  const [items, setItems] = useState<any[]>([]);
+  const [products, setProducts] = useState<any[]>([]);
+  const [edit, setEdit] = useState<any>(null);
+  const [pickQ, setPickQ] = useState('');
+  const [listQ, setListQ] = useState('');
+  const load = useCallback(() => {
+    arpc<any[]>('admin_list_additions', { p_token: token }).then(setItems).catch(() => {});
+  }, [token]);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await sb.rpc('get_catalog');
+        setProducts((data as any)?.products ?? []);
+      } catch {}
+    })();
+  }, []);
+  const { busy, wrap } = useAdminAction();
+  const pName = (id: number) => products.find((p) => p.id === id)?.name_ar ?? ('#' + id);
+  const toggle = (pid: number) => setEdit((e: any) => {
+    const ids: number[] = e.product_ids ?? [];
+    return { ...e, product_ids: ids.includes(pid) ? ids.filter((x) => x !== pid) : [...ids, pid] };
+  });
+  const filteredProducts = products.filter((p) => !pickQ.trim() || (p.name_ar ?? '').toLowerCase().includes(pickQ.trim().toLowerCase()));
+  const filteredItems = items.filter((a) => !listQ.trim() || (a.name_ar ?? '').toLowerCase().includes(listQ.trim().toLowerCase()));
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-base font-extrabold text-coffee-900">الإضافات ({items.length})</h2>
+        <div className="flex items-center gap-2">
+          <input value={listQ} onChange={(e) => setListQ(e.target.value)} placeholder="بحث في الإضافات…" className={`${inputCls} w-44`} />
+          <button onClick={() => { setEdit({ ...EMPTY_ADD }); setPickQ(''); }} className={btnCls}>+ إضافة جديدة</button>
+        </div>
+      </div>
+      <p className="text-[11px] font-bold text-neutral-500">الإضافة خيار يختاره الزبان مع المنتج وتُضاف قيمتها على سعر المنتج تلقائياً</p>
+      <div className="grid gap-3 md:grid-cols-2">
+        {filteredItems.map((a) => (
+          <Card key={a.id} className={a.is_active ? '' : 'opacity-50'}>
+            <div className="flex items-center justify-between">
+              <p className="text-sm font-extrabold text-coffee-900">{a.name_ar}</p>
+              <p className="text-xs font-extrabold text-gold-deep">{a.price_mode === 'subtract' ? '−' : '+'} {eur(a.price_cents, 'ل.س')}</p>
+            </div>
+            <p className="mt-1 text-[10.5px] font-bold text-neutral-400">
+              {(a.product_ids ?? []).length === 0 ? 'غير مرتبطة بمنتجات بعد' : 'ترتبط بـ ' + a.product_ids.length + ' منتج: ' + (a.product_ids ?? []).map(pName).slice(0, 4).join('، ') + ((a.product_ids ?? []).length > 4 ? '…' : '')}
+            </p>
+            <div className="mt-2 flex gap-2">
+              <button onClick={() => { setEdit({ ...a, price_mode: a.price_mode ?? 'add' }); setPickQ(''); }} className="rounded-lg bg-[#E3E9C8] px-3 py-1.5 text-[11px] font-extrabold text-neutral-700">تعديل</button>
+              <button disabled={busy} onClick={() => wrap(async () => {
+                if (!window.confirm('حذف الإضافة «' + a.name_ar + '» نهائيًا؟')) return;
+                await arpc('admin_delete_addition', { p_token: token, p_addition_id: a.id });
+                load();
+              })} className="rounded-lg bg-red-50 px-3 py-1.5 text-[11px] font-extrabold text-red-600">حذف</button>
+            </div>
+          </Card>
+        ))}
+        {items.length === 0 && <p className="rounded-2xl bg-[#F6F0E2] p-6 text-center text-xs font-bold text-neutral-400">لا توجد إضافات بعد</p>}
+      </div>
+
+      {edit && (
+        <div className="fixed inset-0 z-[110] grid place-items-center bg-black/50 p-4 backdrop-blur-sm anim-fade">
+          <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-3xl bg-white p-6 shadow-2xl anim-pop">
+            <h3 className="text-base font-extrabold text-coffee-900">{edit.id ? 'تعديل إضافة' : 'إضافة جديدة'}</h3>
+            <div className="mt-4 space-y-3">
+              <Field label="اسم الإضافة"><input className={inputCls} value={edit.name_ar} onChange={(e) => setEdit({ ...edit, name_ar: e.target.value })} placeholder="مثال: شوت إسبرسو زيادة أو كوب صغير" /></Field>
+              <Field label="سعر الإضافة (ل.س)"><input type="number" className={inputCls} value={edit.price_cents} onChange={(e) => setEdit({ ...edit, price_cents: e.target.value })} placeholder="3000" /></Field>
+               <Field label="نوع التأثير على السعر">
+                 <select className={inputCls} value={edit.price_mode ?? 'add'} onChange={(e) => setEdit({ ...edit, price_mode: e.target.value })}>
+                   <option value="add">زيادة (+) — تُضاف للسعر</option>
+                   <option value="subtract">استنقاص (−) — تُستثنى من السعر (مثل كوب صغير)</option>
+                 </select>
+               </Field>
+               <Field label="المنتجات التي تُعرض معها (اختيار متعدد)">
+                 <input value={pickQ} onChange={(e) => setPickQ(e.target.value)} placeholder="ابحث عن منتج…" className={`${inputCls} mb-2 w-full`} />
+                 <div className="max-h-48 space-y-0.5 overflow-y-auto rounded-xl border-2 border-beige p-2">
+                   {filteredProducts.map((p) => (
+                     <label key={p.id} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs font-bold text-neutral-700 hover:bg-[#F6F0E2]">
+                       <input type="checkbox" checked={(edit.product_ids ?? []).includes(p.id)} onChange={() => toggle(p.id)} />
+                       {p.name_ar}
+                     </label>
+                   ))}
+                   {filteredProducts.length === 0 && <p className="py-3 text-center text-[11px] font-bold text-neutral-400">لا نتائج</p>}
+                 </div>
+               </Field>
+              <Field label="نشط">
+                <select className={inputCls} value={String(edit.is_active)} onChange={(e) => setEdit({ ...edit, is_active: e.target.value === 'true' })}>
+                  <option value="true">نعم</option><option value="false">لا</option>
+                </select>
+              </Field>
+            </div>
+            <div className="mt-5 grid grid-cols-2 gap-3">
+              <button disabled={busy || !edit.name_ar?.trim()} onClick={() => wrap(async () => {
+                await arpc('admin_save_addition', { p_token: token, p_addition: { ...edit, price_cents: Number(edit.price_cents) || 0 } });
+                setEdit(null); load();
+              })} className="rounded-2xl bg-gradient-to-l from-gold to-gold-deep py-3 text-sm font-extrabold text-white disabled:opacity-50">حفظ</button>
+              <button onClick={() => setEdit(null)} className="rounded-2xl bg-neutral-100 py-3 text-sm font-extrabold text-neutral-600">إلغاء</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RewardsTab({ token }: { token: string }) {
+  const [rewards, setRewards] = useState<any[]>([]);
+  const [redemptions, setRedemptions] = useState<any[]>([]);
+  const [edit, setEdit] = useState<any>(null);
+  const load = useCallback(() => {
+    arpc<any[]>('admin_list_rewards', { p_token: token }).then(setRewards).catch(() => {});
+    arpc<any[]>('admin_list_redemptions', { p_token: token }).then(setRedemptions).catch(() => {});
+  }, [token]);
+  useEffect(() => { load(); }, [load]);
+  const { busy, wrap } = useAdminAction();
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-base font-extrabold text-coffee-900">المكافآت ({rewards.length})</h2>
+        <button onClick={() => setEdit({ ...EMPTY_REWARD })} className={btnCls}>+ مكافأة جديدة</button>
+      </div>
+      <div className="grid gap-3 md:grid-cols-3">
+        {rewards.map((r) => (
+          <Card key={r.id} className={r.is_active ? '' : 'opacity-50'}>
+            <img src={r.image_url} alt="" className="h-28 w-full rounded-2xl object-cover" />
+            <p className="mt-2 text-sm font-extrabold text-coffee-900">{r.name_ar}</p>
+            <p className="text-xs font-extrabold text-gold-deep">⭐ {r.points_cost} نقطة</p>
+            {r.expires_at && <p className="text-[10px] font-bold text-amber-700">صالح حتى: {r.expires_at.slice(0,10)}</p>}
+            <p className="text-[11px] text-neutral-400">استبدالات: {r.redemptions_count}</p>
+            <div className="mt-2 flex gap-2">
+              <button onClick={() => setEdit({ ...r })} className="rounded-lg bg-[#E3E9C8] px-3 py-1.5 text-[11px] font-extrabold text-neutral-700">تعديل</button>
+              <button disabled={busy} onClick={() => wrap(async () => {
+                if (!window.confirm('حذف نهائي للمكافأة «' + r.name_ar + '»؟ أكواد الزبائن القديمة تبقى صالحة.')) return;
+                await arpc('admin_delete_reward', { p_token: token, p_reward_id: r.id });
+                load();
+              })} className="rounded-lg bg-red-50 px-3 py-1.5 text-[11px] font-extrabold text-red-600">حذف نهائي</button>
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <h2 className="pt-2 text-base font-extrabold text-coffee-900">أكواد الاستبدال ({redemptions.length})</h2>
+      <Card className="overflow-x-auto p-0">
+        <table className="w-full text-right text-xs">
+          <thead><tr className="border-b border-beige text-neutral-400">
+            <th className="p-3 font-extrabold">الكود</th><th className="p-3 font-extrabold">المكافأة</th>
+            <th className="p-3 font-extrabold">العميل</th><th className="p-3 font-extrabold">النقاط</th>
+<th className="p-3 font-extrabold">الحالة</th><th className="p-3 font-extrabold">صالح حتى</th><th className="p-3"></th>
+          </tr></thead>
+          <tbody>
+            {redemptions.map((r) => (
+              <tr key={r.code} className="border-b border-beige/50">
+                <td className="p-3 font-mono text-sm font-black tracking-widest text-coffee-900" dir="ltr">{r.code}</td>
+                <td className="p-3 font-bold">{r.reward_name}</td>
+                <td className="p-3">{r.customer_name}</td>
+                <td className="p-3">⭐ {r.points_cost}</td>
+                <td className="p-3"><span className={`rounded-full px-2 py-1 text-[10px] font-extrabold ${r.status === 'unused' ? 'bg-emerald-100 text-emerald-700' : r.status === 'used' ? 'bg-neutral-100 text-neutral-500' : 'bg-red-50 text-red-500'}`}>
+{r.status === 'unused' ? 'غير مستخدم' : r.status === 'used' ? 'مستخدم' : 'منتهي'}</span></td>
+                 <td className="p-3 text-[10px] font-bold text-amber-700" dir="ltr">{r.expires_at ? new Date(r.expires_at).toLocaleDateString('ar-EG') : '—'}</td>
+                 <td className="p-3">
+                  {r.status === 'unused' && (
+                    <button disabled={busy} onClick={() => wrap(async () => { await arpc('admin_set_redemption_status', { p_token: token, p_code: r.code, p_status: 'used' }); load(); })}
+                      className="rounded-lg bg-[#E3E9C8] px-3 py-1.5 text-[10px] font-extrabold text-neutral-700">تعليم كمستخدم</button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+
+      {edit && (
+        <div className="fixed inset-0 z-[110] grid place-items-center bg-black/50 p-4 backdrop-blur-sm anim-fade">
+          <div className="w-full max-w-sm rounded-3xl bg-white p-6 shadow-2xl anim-pop">
+            <h3 className="text-base font-extrabold text-coffee-900">{edit.id ? 'تعديل مكافأة' : 'مكافأة جديدة'}</h3>
+            <div className="mt-4 space-y-3">
+              <Field label="الاسم"><input className={inputCls} value={edit.name_ar} onChange={(e) => setEdit({ ...edit, name_ar: e.target.value })} /></Field>
+              <Field label="النقاط المطلوبة"><input type="number" className={inputCls} value={edit.points_cost} onChange={(e) => setEdit({ ...edit, points_cost: +e.target.value })} /></Field>
+              <Field label="عدد أيام الاستبدال">
+                <input type="number" min="0" className={inputCls} value={edit.redemption_days ?? ''} onChange={(e) => setEdit({ ...edit, redemption_days: e.target.value })} placeholder="مثال: 7" />
+              </Field>
+              <p className="text-[10px] font-bold text-neutral-400">عدد الأيام التي يبقى فيها كود الاستبدال صالحاً للزبون بعد استبداله</p>
+              <Field label="تاريخ صلاحية المكافأة (اختياري)">
+                <input type="date" className={inputCls} value={edit.expires_at ? edit.expires_at.substring(0,10) : ''} onChange={(e) => setEdit({ ...edit, expires_at: e.target.value ? e.target.value : null })} />
+              </Field>
+              <p className="text-[10px] font-bold text-neutral-400">تاريخ انتهاء ظهور المكافأة في التطبيق</p>
+              <Field label="صورة المكافأة"><ImageUploadField value={edit.image_url} onChange={(url) => setEdit({ ...edit, image_url: url })} folder="rewards" /></Field>
+              <Field label="نشط">
+                <select className={inputCls} value={String(edit.is_active ?? true)} onChange={(e) => setEdit({ ...edit, is_active: e.target.value === 'true' })}>
+                  <option value="true">نعم</option><option value="false">لا</option>
+                </select>
+              </Field>
+            </div>
+            <div className="mt-5 grid grid-cols-2 gap-3">
+              <button disabled={busy} onClick={() => wrap(async () => {
+                const payload = { ...edit };
+                if (payload.expires_at === '') payload.expires_at = null;
+                if (payload.redemption_days === '' || payload.redemption_days === null || payload.redemption_days === undefined) delete payload.redemption_days;
+                else payload.redemption_days = Number(payload.redemption_days);
+                await arpc('admin_save_reward', { p_token: token, p_reward: payload });
+                setEdit(null);
+                load();
+              })}
+                className="rounded-2xl bg-gradient-to-l from-gold to-gold-deep py-3 text-sm font-extrabold text-white disabled:opacity-50">حفظ</button>
+              <button onClick={() => setEdit(null)} className="rounded-2xl bg-neutral-100 py-3 text-sm font-extrabold text-neutral-600">إلغاء</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================ الإعلانات ============================ */
+const EMPTY_AD = { id: 0, image_url: '/img/latte.jpg', category_slug: '', description_ar: '', ends_at: '', is_active: true, full_screen: false, show_in_hero: true, popup_after_2min: false };
+function AdsTab({ token }: { token: string }) {
+  const [ads, setAds] = useState<any[]>([]);
+  const [cats, setCats] = useState<any[]>([]);
+  const [edit, setEdit] = useState<any>(null);
+  const load = useCallback(() => { arpc<any[]>('admin_list_ads', { p_token: token }).then(setAds).catch(() => {}); }, [token]);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await sb.rpc('get_catalog');
+        setCats((data as any)?.categories ?? []);
+      } catch {}
+    })();
+  }, []);
+  const { busy, wrap } = useAdminAction();
+  const catName = (slug: string) => cats.find((c) => c.slug === slug)?.name_ar ?? slug;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h2 className="text-base font-extrabold text-coffee-900">الإعلانات ({ads.length})</h2>
+        <button onClick={() => setEdit({ ...EMPTY_AD })} className={btnCls}>+ إعلان جديد</button>
+      </div>
+      <p className="text-[11px] font-bold text-neutral-500">الإعلان موجّه لفئة كاملة من المنتجات — يظهر في الهيرو/وسط الشاشة، وعروض الأصناف الفردية تُحدَّد من زر «عرض» في تبويب المنتجات</p>
+      <div className="grid gap-3 md:grid-cols-2">
+        {ads.map((a) => (
+          <Card key={a.id} className={a.is_active ? '' : 'opacity-50'}>
+            <div className="flex gap-3">
+              <img src={a.image_url} alt="" className="size-20 rounded-2xl object-cover" />
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-extrabold text-coffee-900">{a.title}
+                  {a.popup_after_2min && a.show_in_hero !== false ? (
+                    <span className="ms-2 rounded-full bg-[#414D36] px-2 py-0.5 text-[9px] font-black text-[#C9D3A8]">منبثق + هيرو</span>
+                  ) : a.popup_after_2min ? (
+                    <span className="ms-2 rounded-full bg-[#414D36] px-2 py-0.5 text-[9px] font-black text-[#C9D3A8]">إعلان منبثق بعد دقيقتين</span>
+                  ) : (
+                    <span className="ms-2 rounded-full bg-[#D5DEB4] px-2 py-0.5 text-[9px] font-black text-[#414D36]">ضمن الهيرو</span>
+                  )}
+                </p>
+                <p className="mt-0.5 text-xs text-neutral-500">{a.description_ar}</p>
+                <p className="mt-0.5 text-[10px] font-bold text-neutral-400">
+                  {a.popup_after_2min
+                    ? (a.show_in_hero !== false ? 'إعلان منبثق بعد دقيقتين من التصفح + ضمن الهيرو المتنقل' : 'إعلان منبثق بعد دقيقتين من التصفح')
+                    : 'يظهر ضمن الهيرو المتنقل'}
+                  {a.ends_at ? ' · حتى ' + new Date(a.ends_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'numeric', year: 'numeric' }) : ' · بلا نهاية'}
+                </p>
+                {a.category_slug && (
+                  <span className="mt-1 inline-block rounded-full bg-[#EEF2DC] px-2.5 py-1 text-[10px] font-black text-[#414D36]">🏷️ فئة: {catName(a.category_slug)}</span>
+                )}
+              </div>
+            </div>
+            <div className="mt-2 flex gap-2">
+              <button onClick={() => setEdit({ ...EMPTY_AD, ...a, popup_after_2min: a.popup_after_2min ?? a.full_screen ?? false, show_in_hero: a.show_in_hero !== false, ends_at: a.ends_at ? a.ends_at.slice(0, 16) : '' })} className="rounded-lg bg-[#E3E9C8] px-3 py-1.5 text-[11px] font-extrabold text-neutral-700">تعديل</button>
+              <button disabled={busy} onClick={() => wrap(async () => { await arpc('admin_delete_ad', { p_token: token, p_id: a.id }); load(); })}
+                className="rounded-lg bg-red-50 px-3 py-1.5 text-[11px] font-extrabold text-red-600">حذف</button>
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      {edit && (
+        <div className="fixed inset-0 z-[110] grid place-items-center bg-black/50 p-4 backdrop-blur-sm anim-fade">
+          <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-3xl bg-white p-6 shadow-2xl anim-pop">
+            <h3 className="text-base font-extrabold text-coffee-900">{edit.id ? 'تعديل إعلان' : 'إعلان جديد'}</h3>
+            <div className="mt-4 space-y-3">
+              <Field label="فئة المنتجات المستهدفة — العنوان يُشتق منها تلقائيًا (مثال: عروض الموهيتو)">
+                <select className={inputCls} value={edit.category_slug ?? ''} onChange={(e) => setEdit({ ...edit, category_slug: e.target.value })}>
+                  <option value="">— اختر الفئة —</option>
+                  {cats.map((c) => <option key={c.slug} value={c.slug}>{c.name_ar}</option>)}
+                </select>
+              </Field>
+              <Field label="الوصف"><textarea className={`${inputCls} h-20 py-2`} value={edit.description_ar} onChange={(e) => setEdit({ ...edit, description_ar: e.target.value })} placeholder="مثال: عرض حصري على أغلب أصناف الموهيتو" /></Field>
+              <Field label="نهاية العرض (اختياري — يبدأ فور الحفظ)"><input type="datetime-local" className={inputCls} dir="ltr" value={edit.ends_at} onChange={(e) => setEdit({ ...edit, ends_at: e.target.value })} /></Field>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="نشط">
+                  <select className={inputCls} value={String(edit.is_active)} onChange={(e) => setEdit({ ...edit, is_active: e.target.value === 'true' })}>
+                    <option value="true">نعم</option><option value="false">لا</option>
+                  </select>
+                </Field>
+                <Field label="مكان الظهور">
+                  <select className={inputCls} value={edit.popup_after_2min ? (edit.show_in_hero !== false ? 'both' : 'popup') : 'hero'}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setEdit({ ...edit, show_in_hero: v !== 'popup', popup_after_2min: v !== 'hero', full_screen: v !== 'hero' });
+                    }}>
+                    <option value="hero">ضمن الهيرو فقط</option>
+                    <option value="popup">إعلان منبثق بعد دقيقتين فقط</option>
+                    <option value="both">الظهور ضمن الهيرو وإعلان منبثق معًا</option>
+                  </select>
+                </Field>
+              </div>
+              {edit.popup_after_2min && (
+                <p className="rounded-xl bg-[#EEF2DC] px-3 py-2 text-[10.5px] font-bold leading-relaxed text-[#77825E]">
+                  {edit.show_in_hero !== false
+                    ? 'الإعلان المنبثق يظهر للزبون بعد دقيقتين من التصفح، ويظهر أيضًا ضمن الهيرو المتنقل في الرئيسية.'
+                    : 'الإعلان المنبثق يظهر للزبون بعد دقيقتين من التصفح، ولا يظهر ضمن الهيرو.'}
+                </p>
+              )}
+              <Field label="صورة الإعلان"><ImageUploadField value={edit.image_url} onChange={(url) => setEdit({ ...edit, image_url: url })} folder="ads" /></Field>
+            </div>
+            <div className="mt-5 grid grid-cols-2 gap-3">
+              <button disabled={busy || !(edit.category_slug ?? '').trim()} onClick={() => wrap(async () => {
+                const ad = { ...edit, ends_at: edit.ends_at ? new Date(edit.ends_at).toISOString() : '' };
+                await arpc('admin_save_ad', { p_token: token, p_ad: ad });
+                setEdit(null); load();
+              })}
+                className="rounded-2xl bg-gradient-to-l from-gold to-gold-deep py-3 text-sm font-extrabold text-white disabled:opacity-50">حفظ</button>
+              <button onClick={() => setEdit(null)} className="rounded-2xl bg-neutral-100 py-3 text-sm font-extrabold text-neutral-600">إلغاء</button>
+            </div>
+            <p className="mt-3 rounded-xl bg-[#EEF2DC] px-3 py-2 text-[10.5px] font-bold leading-relaxed text-[#77825E]">
+              لحسم أسعار أصناف محددة داخل الفئة (سعر مشطوب + شارة «عرض» للزبون) استخدم زر «عرض» في تبويب المنتجات.
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================ إشعار ============================ */
+function NotifyTab({ token }: { token: string }) {
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  const [msg, setMsg] = useState('');
+  const { busy, wrap } = useAdminAction();
+  return (
+    <div className="mx-auto max-w-md">
+      <h2 className="mb-3 text-base font-extrabold text-coffee-900">إرسال إشعار</h2>
+      <Card className="space-y-3">
+        <Field label="العنوان"><input className={inputCls} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="مثال: ☕ عرض الجمعة!" /></Field>
+        <Field label="النص"><textarea className={`${inputCls} h-24 py-2`} value={body} onChange={(e) => setBody(e.target.value)} placeholder="تفاصيل الإشعار…" /></Field>
+        {msg && <p className="rounded-xl bg-green-50 px-3 py-2 text-center text-xs font-extrabold text-green-700">{msg}</p>}
+        <button disabled={busy || !title} onClick={() => wrap(async () => {
+          const n = await arpc<number>('admin_send_notification', { p_token: token, p_title: title, p_body: body, p_customer_id: null });
+          setMsg(`تم الإرسال إلى ${n} عميل ✓`); setTitle(''); setBody('');
+          setTimeout(() => setMsg(''), 4000);
+        })} className={`w-full rounded-2xl py-3 text-sm font-extrabold text-white shadow active:scale-[.98] disabled:opacity-40 ${btnCls}`} style={{ borderRadius: 16 }}>
+          {busy ? 'جارٍ الإرسال…' : 'إرسال الإشعار'}
+        </button>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================ كود الخصم ============================ */
+function PromoTab({ token }: { token: string }) {
+  const [settings, setSettings] = useState<Record<string, string>>({});
+  const [msg, setMsg] = useState('');
+  const [catalog, setCatalog] = useState<any>(null);
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await sb.rpc('get_catalog');
+        setCatalog(data as any);
+      } catch {}
+    })();
+  }, []);
+  const load = useCallback(() => { arpc<Record<string, string>>('admin_get_settings', { p_token: token }).then(setSettings).catch(() => {}); }, [token]);
+  useEffect(() => { load(); }, [load]);
+  const { busy, wrap } = useAdminAction();
+
+  return (
+    <div className="mx-auto max-w-md">
+      <h2 className="mb-1 text-base font-extrabold text-coffee-900">كود الخصم</h2>
+      <p className="mb-3 text-[11px] font-bold text-neutral-500">انشر كود خصم يظهر في الشاشة الرئيسية، ويستخدمه الزبون في الكشك للحصول على الخصم</p>
+      <Card className="space-y-3">
+        {settings.promo_code && settings.promo_discount && (
+          <div className="rounded-2xl bg-[#EEF2DC] p-3.5 text-center">
+            <p className="text-[10px] font-black text-[#7C8665]">الكود المنشور حاليًا</p>
+            <p className="mt-0.5 font-mono text-2xl font-black tracking-[.25em] text-coffee-900" dir="ltr">{settings.promo_code}</p>
+            <p className="mt-1 text-[11px] font-extrabold text-[#7C8F52]">خصم {settings.promo_discount}%</p>
+          </div>
+        )}
+        <Field label="الكود (حروف وأرقام)"><input className={inputCls} dir="ltr" value={settings.promo_code ?? ''} onChange={(e) => setSettings({ ...settings, promo_code: e.target.value.toUpperCase() })} placeholder="DOSE50" /></Field>
+        <Field label="نسبة الخصم % (1 - 90)"><input type="number" className={inputCls} value={settings.promo_discount ?? ''} onChange={(e) => setSettings({ ...settings, promo_discount: e.target.value })} placeholder="20" /></Field>
+        <Field label="نطاق الكود">
+          <select className={inputCls} value={settings.promo_scope ?? 'all'} onChange={(e) => setSettings({ ...settings, promo_scope: e.target.value, promo_target: '' })}>
+            <option value="all">على الطلب كاملًا</option>
+            <option value="product">منتج محدد فقط</option>
+            <option value="category">فئة محددة فقط</option>
+            <option value="menu">menu قائمة محددة فقط</option>
+          </select>
+        </Field>
+        {settings.promo_scope === 'product' && (
+          <Field label="اختر المنتج">
+            <select className={inputCls} value={settings.promo_target ?? ''} onChange={(e) => setSettings({ ...settings, promo_target: e.target.value })}>
+              <option value="">— اختر —</option>
+              {(catalog?.products ?? []).map((p: any) => <option key={p.id} value={String(p.id)}>{p.name_ar}</option>)}
+            </select>
+          </Field>
+        )}
+        {settings.promo_scope === 'category' && (
+          <Field label="اختر الفئة">
+            <select className={inputCls} value={settings.promo_target ?? ''} onChange={(e) => setSettings({ ...settings, promo_target: e.target.value })}>
+              <option value="">— اختر —</option>
+              {(catalog?.categories ?? []).map((c: any) => <option key={c.id} value={c.slug}>{c.name_ar}</option>)}
+            </select>
+          </Field>
+        )}
+        {settings.promo_scope === 'menu' && (
+          <Field label="اختر القائمة المخصصة">
+            <select className={inputCls} value={settings.promo_target ?? ''} onChange={(e) => setSettings({ ...settings, promo_target: e.target.value })}>
+              <option value="">— اختر —</option>
+              {(catalog?.menus ?? []).map((m: any) => <option key={m.id} value={String(m.id)}>{(m.emoji || '☕') + ' ' + m.title}</option>)}
+            </select>
+          </Field>
+        )}
+        {msg && <p className="rounded-xl bg-green-50 px-3 py-2 text-center text-xs font-extrabold text-green-700">{msg}</p>}
+        <button disabled={busy || !(settings.promo_code ?? '').trim()} onClick={() => wrap(async () => {
+          const r = await arpc<{ notified: number }>('admin_publish_promo', { p_token: token, p_code: settings.promo_code, p_discount: Number(settings.promo_discount), p_scope: settings.promo_scope ?? 'all', p_target: settings.promo_scope === 'all' ? null : (settings.promo_target ?? null) });
+          setMsg('تم نشر الكود — أُرسل إشعار داخلي وفوري إلى ' + (r.notified ?? 'كل') + ' الزبائن ✓');
+          load(); setTimeout(() => setMsg(''), 6000);
+        })} className={`${btnCls} w-full`} style={{ borderRadius: 16, height: 46 }}>
+          {busy ? 'جارٍ النشر…' : 'نشر الكود وإرسال الإشعارات'}
+        </button>
+        {settings.promo_code && (
+          <button disabled={busy} onClick={() => wrap(async () => {
+            await arpc('admin_delete_promo', { p_token: token });
+            setMsg('حُذف كود الخصم — اختفى من التطبيق'); load();
+            setTimeout(() => setMsg(''), 5000);
+          })} className="w-full rounded-2xl bg-red-50 py-3 text-sm font-black text-[#C4482E] transition active:scale-[.98] disabled:opacity-40">
+            🗑️ حذف كود الخصم
+          </button>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ============================ توقيت دوامي ============================ */
+function HoursTab({ token }: { token: string }) {
+  const [workOpen, setWorkOpen] = useState('');
+  const [workClose, setWorkClose] = useState('');
+  const [closedMessage, setClosedMessage] = useState('');
+  const [msg, setMsg] = useState('');
+  const [, setTick] = useState(0);
+  const load = useCallback(() => { arpc<Record<string, string>>('admin_get_settings', { p_token: token }).then((s) => { setWorkOpen(s.work_open ?? ''); setWorkClose(s.work_close ?? ''); setClosedMessage(s.closed_message ?? ''); }).catch(() => {}); }, [token]);
+  useEffect(() => { load(); }, [load]);
+  /* تحديث حالة «مفتوح/مغلق» الحية كل دقيقة */
+  useEffect(() => { const t = setInterval(() => setTick((x) => x + 1), 60000); return () => clearInterval(t); }, []);
+  const { busy, wrap } = useAdminAction();
+  const st = shopStatus({ work_open: workOpen, work_close: workClose });
+  const norm = (t: string) => (t ? t.split(':').map((x, i) => (i === 0 ? String(Number(x)).padStart(2, '0') : x)).join(':') : '');
+
+  return (
+    <div className="mx-auto max-w-md">
+      <h2 className="mb-1 text-base font-extrabold text-coffee-900">توقيت دوامي</h2>
+      <p className="mb-3 text-[11px] font-bold text-neutral-500">حدّد وقت فتح المحل وغلقه — يُمنع الطلب خارج الدوام في التطبيق والكشك تلقائيًا</p>
+      <Card className="space-y-4">
+        {/* الحالة الحية */}
+        <div className={`rounded-2xl p-4 text-center ${st.closed ? 'bg-[#FBEDE9]' : 'bg-[#EEF2DC]'}`}>
+          <p className={`text-lg font-black ${st.closed ? 'text-[#C4482E]' : 'text-[#414D36]'}`}>
+            {st.closed ? '🌙 المحل مغلق الآن' : '🟢 المحل مفتوح الآن'}
+          </p>
+          <p className="mt-1 text-[11px] font-bold text-neutral-500" dir="ltr">
+            {workOpen || '--:--'} → {workClose || '--:--'} (بتوقيت دمشق)
+          </p>
+        </div>
+        <Field label="وقت الفتح">
+          <input type="time" className={inputCls} dir="ltr" value={workOpen} onChange={(e) => setWorkOpen(e.target.value)} />
+        </Field>
+        <Field label="وقت الإغلاق">
+          <input type="time" className={inputCls} dir="ltr" value={workClose} onChange={(e) => setWorkClose(e.target.value)} />
+        </Field>
+        <Field label="رسالة الإغلاق (اختياري — بأسلوبك ومزاجك)">
+          <textarea className={`${inputCls} h-24 py-2`} value={closedMessage} onChange={(e) => setClosedMessage(e.target.value)}
+            placeholder="مثال: خلاص قفلنا اليوم 🌙 عساك من أهل الجنة، باجهزكم الساعة 10 صباحًا ☕" />
+        </Field>
+        {msg && <p className="rounded-xl bg-green-50 px-3 py-2 text-center text-xs font-extrabold text-green-700">{msg}</p>}
+        <button disabled={busy} onClick={() => wrap(async () => {
+          await arpc('admin_save_settings', { p_token: token, p_settings: { work_open: norm(workOpen), work_close: norm(workClose), closed_message: closedMessage } });
+          setMsg('حُفظ التوقيت والرسالة — سارٍ فورًا في التطبيق والكشك ✓');
+          setTimeout(() => setMsg(''), 5000);
+        })} className={`${btnCls} w-full`} style={{ borderRadius: 16, height: 46 }}>
+          {busy ? 'جارٍ الحفظ…' : 'حفظ التوقيت'}
+        </button>
+        <p className="rounded-xl bg-[#EEF2DC] px-3 py-2 text-[10.5px] font-bold leading-relaxed text-[#77825E]">
+          عند الإغلاق يظهر للزبون رسالتك (أو الرسالة الافتراضية إذا تركت الحقل فارغًا) مع موعد الفتح، ولا يستطيع النقر على زر الطلب — كما يُرفض أي طلب خارج الدوام من الخادم.
+        </p>
+      </Card>
+    </div>
+  );
+}
+
+
+/* ============================ وقت الطلب ============================ */
+function OrderTimeTab({ token }: { token: string }) {
+  const [settings, setSettings] = useState<Record<string, string>>({});
+  const [msg, setMsg] = useState('');
+  const load = useCallback(() => { arpc<Record<string, string>>('admin_get_settings', { p_token: token }).then(setSettings).catch(() => {}); }, [token]);
+  useEffect(() => { load(); }, [load]);
+  const { busy, wrap } = useAdminAction();
+  const current = Math.max(0, parseInt(settings.order_time_minutes || '0', 10) || 0);
+  return (
+    <div className="mx-auto max-w-md">
+      <h2 className="mb-3 text-base font-extrabold text-coffee-900">وقت الطلب</h2>
+      <Card className="space-y-3">
+        <p className="text-[11px] font-bold text-neutral-500">
+          الوقت المقدر (بالدقائق) لإنجاز الطلب — يظهر هذا الوقت ضمن تفاصيل كل طلب لكل الزبائن، ويمكن لصاحب المحل تغييره أو تعديله في أي وقت بحرية كاملة.
+        </p>
+        <Field label="الوقت المقدر للطلب (دقيقة)">
+          <input type="number" min="1" max="180" className={inputCls} dir="ltr"
+            value={settings.order_time_minutes ?? ''}
+            onChange={(e) => setSettings({ ...settings, order_time_minutes: e.target.value })}
+            placeholder="مثال: 15" />
+        </Field>
+        {current > 0 && (
+          <div className="flex items-center gap-2 rounded-xl bg-[#C9D3A8] px-3 py-2.5">
+            <Icon name="timer" size={15} className="text-[#26301C]" />
+            <span className="text-[11px] font-extrabold text-[#26301C]">الزبون سيرى في تفاصيل طلبه: ⏱️ {current} دقيقة</span>
+          </div>
+        )}
+        {msg && <p className="rounded-xl bg-green-50 px-3 py-2 text-center text-xs font-extrabold text-green-700">{msg}</p>}
+        <button disabled={busy} onClick={() => wrap(async () => {
+          await arpc('admin_save_settings', { p_token: token, p_settings: settings });
+          load(); setMsg('تم حفظ وقت الطلب ✓'); setTimeout(() => setMsg(''), 4000);
+        })}
+          className={`w-full ${btnCls}`} style={{ borderRadius: 16, height: 44 }}>حفظ وقت الطلب</button>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================ الإعدادات ============================ */
+function SettingsTab({ token }: { token: string }) {
+  const [settings, setSettings] = useState<Record<string, string>>({});
+  const load = useCallback(() => { arpc<Record<string, string>>('admin_get_settings', { p_token: token }).then(setSettings).catch(() => {}); }, [token]);
+  useEffect(() => { load(); }, [load]);
+  const { busy, wrap } = useAdminAction();
+  const fields = [
+    { key: 'whatsapp_number', label: 'رقم WhatsApp للمحل (بصيغة دولية بدون +)' },
+    { key: 'store_phone', label: 'رقم هاتف المحل' },
+    { key: 'shop_maps_url', label: 'رابط موقع المحل على خرائط جوجل (Google Maps)' },
+    { key: 'currency_symbol', label: 'رمز العملة' },
+    { key: 'points_award_mode', label: 'منح النقاط (on_create: عند الطلب — on_complete: عند الإكمال)' },
+  ];
+  return (
+    <div className="mx-auto max-w-md">
+      <h2 className="mb-3 text-base font-extrabold text-coffee-900">إعدادات المنصة</h2>
+      <Card className="space-y-3">
+        {fields.map((f) => (
+          <Field key={f.key} label={f.label}>
+            {f.key === 'points_award_mode' ? (
+              <select className={inputCls} value={settings[f.key] ?? 'on_complete'}
+                onChange={(e) => setSettings({ ...settings, [f.key]: e.target.value })}>
+                <option value="on_complete">عند إكمال الطلب</option>
+                
+              </select>
+            ) : (
+              <input className={inputCls} dir="ltr" value={settings[f.key] ?? ''} onChange={(e) => setSettings({ ...settings, [f.key]: e.target.value })} />
+            )}
+          </Field>
+        ))}
+        <button disabled={busy} onClick={() => wrap(async () => { await arpc('admin_save_settings', { p_token: token, p_settings: settings }); load(); alert('تم الحفظ ✓'); })}
+          className={`w-full ${btnCls}`} style={{ borderRadius: 16, height: 44 }}>حفظ الإعدادات</button>
+      </Card>
+
+      
+    </div>
+  );
+}
+
+/* ============================ صلاحيات العميل ============================ */
+function PermissionsTab({ token }: { token: string }) {
+  const [settings, setSettings] = useState<Record<string, string>>({});
+  const [msg, setMsg] = useState('');
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(() => { arpc<Record<string, string>>('admin_get_settings', { p_token: token }).then(setSettings).catch(() => {}); }, [token]);
+  useEffect(() => { load(); }, [load]);
+
+  const pointsExpireDays = settings.points_expire_days ?? '';
+
+  return (
+    <div className="mx-auto max-w-md">
+      <h2 className="mb-1 text-base font-extrabold text-coffee-900">صلاحيات العميل</h2>
+      <p className="mb-3 text-[11px] font-bold text-neutral-500">ضبط صلاحية النقاط تلقائياً</p>
+      <Card className="space-y-4">
+        <Field label="عدد أيام صلاحية النقاط">
+          <input type="number" min="0" className={inputCls} value={pointsExpireDays} onChange={(e) => setSettings({ ...settings, points_expire_days: e.target.value })} placeholder="مثال: 30" />
+        </Field>
+        <p className="text-[10px] font-bold text-neutral-400">بعد تجاوز هذا العدد من الأيام يتم تصفير نقاط المستخدمين تلقائياً</p>
+        {msg && <p className="rounded-xl bg-green-50 px-3 py-2 text-center text-xs font-extrabold text-green-700">{msg}</p>}
+        <button disabled={busy} onClick={async () => {
+          setBusy(true);
+          try {
+            await arpc('admin_save_settings', { p_token: token, p_settings: { points_expire_days: pointsExpireDays } });
+            setMsg('حُفظت الصلاحيات بنجاح ✓');
+            setTimeout(() => setMsg(''), 4000);
+          } catch (e: any) { alert(e.message); }
+          setBusy(false);
+        }} className={`${btnCls} w-full`} style={{ borderRadius: 16, height: 46 }}>
+          {busy ? 'جارٍ الحفظ…' : 'حفظ'}
+        </button>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================ تفاصيل الهيرو ============================ */
+function HeroTab({ token }: { token: string }) {
+  const [settings, setSettings] = useState<Record<string, string>>({});
+  const [msg, setMsg] = useState('');
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(() => { arpc<Record<string, string>>('admin_get_settings', { p_token: token }).then(setSettings).catch(() => {}); }, [token]);
+  useEffect(() => { load(); }, [load]);
+
+const heroTitle = settings.hero_title ?? '';
+const heroSubtitle = settings.hero_subtitle ?? '';
+const heroBadge = settings.hero_badge ?? '';
+const heroImage = settings.hero_image_url ?? '';
+  const heroActive = settings.hero_active !== 'false';
+
+  return (
+    <div className="mx-auto max-w-md">
+      <h2 className="mb-1 text-base font-extrabold text-coffee-900">تفاصيل الهيرو</h2>
+      <p className="mb-3 text-[11px] font-bold text-neutral-500">حدّد النص والصورة التي تظهر في الهيرو المتنقل على页面 principal للزبائن</p>
+      <Card className="space-y-4">
+        <Field label="عنوان الهيرو">
+          <input className={inputCls} value={heroTitle} onChange={(e) => setSettings({ ...settings, hero_title: e.target.value })} placeholder="مثال: قهوتك على ذوقك" />
+        </Field>
+        <Field label="شارة الهيرو (النص العلوي)">
+          <input className={inputCls} value={heroBadge} onChange={(e) => setSettings({ ...settings, hero_badge: e.target.value })} placeholder="مثال: قهوة مختصة في كل رشفة" />
+        </Field>
+        <Field label=" Sadd al-Hero (اختياري)">
+          <input className={inputCls} value={heroSubtitle} onChange={(e) => setSettings({ ...settings, hero_subtitle: e.target.value })} placeholder="مثال: وحلويات تُدللها" />
+        </Field>
+        <Field label="صورة الهيرو"><ImageUploadField value={heroImage} onChange={(url) => setSettings({ ...settings, hero_image_url: url })} folder="hero" /></Field>
+        <Field label="عرض الهيرو">
+          <select className={inputCls} value={String(heroActive)} onChange={(e) => setSettings({ ...settings, hero_active: e.target.value })}>
+            <option value="true">نعم — يظهر في الهيرو</option>
+            <option value="false">لا — يُخفى الهيرو</option>
+          </select>
+        </Field>
+        {heroImage && (
+          <div className="overflow-hidden rounded-2xl ring-1 ring-beige">
+            <img src={heroImage} alt="Hero" className="h-40 w-full object-cover" />
+          </div>
+        )}
+        {msg && <p className="rounded-xl bg-green-50 px-3 py-2 text-center text-xs font-extrabold text-green-700">{msg}</p>}
+        <button disabled={busy} onClick={async () => {
+          setBusy(true);
+          try {
+            await arpc('admin_save_settings', { p_token: token, p_settings: { hero_title: heroTitle, hero_subtitle: heroSubtitle, hero_badge: heroBadge, hero_image_url: heroImage, hero_active: String(heroActive) } });
+            setMsg('حُفظ تفاصيل الهيرو — سارٍ فورًا في التطبيقات ✓');
+            setTimeout(() => setMsg(''), 4000);
+          } catch (e: any) { alert(e.message); }
+          setBusy(false);
+        }} className={`${btnCls} w-full`} style={{ borderRadius: 16, height: 46 }}>
+          {busy ? 'جارٍ الحفظ…' : 'حفظ تفاصيل الهيرو'}
+        </button>
+      </Card>
+    </div>
+  );
+}
